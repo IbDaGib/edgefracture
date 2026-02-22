@@ -579,7 +579,7 @@ class TestFormatReportOutput:
         }
         narrative, raw_json = _format_report_output(report)
         assert "Some narrative text." in narrative
-        assert "MedGemma 4B" in narrative
+        assert "MedGemma 1.5 4B" in narrative
         assert "```json" in raw_json
         assert '"urgency": "LOW"' in raw_json
 

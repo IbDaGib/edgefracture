@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 # Install Ollama for MedGemma
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull medgemma-4b-it  # or use GGUF quantized version
+ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M
 ```
 
 ### 2. Download Models & Data
@@ -68,7 +68,7 @@ python app/app.py
 ## Models Used
 
 - **CXR Foundation** (`google/cxr-foundation`) — Zero-shot & linear probe fracture classification
-- **MedGemma 4B** (`medgemma-4b-it` Q4 GGUF) — Clinical report generation via Ollama
+- **MedGemma 1.5 4B** (`medgemma-1.5-4b-it` Q4 GGUF) — Clinical report generation via Ollama
 
 ## Dataset
 

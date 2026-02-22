@@ -38,7 +38,7 @@ ALL 8GB between the CPU and GPU. This means:
 - `torch.cuda.is_available()` = True ✓ (it has a real NVIDIA GPU)
 - But you only have 8GB TOTAL for everything: OS, Python, models, data
 - The OS + desktop uses ~1.5-2GB, leaving you ~6GB for models
-- This is why we're using quantized models (CXR Foundation ~1GB + MedGemma Q4 ~2.5GB = ~3.5GB)
+- This is why we're using quantized models (CXR Foundation ~1GB + MedGemma 1.5 Q4 ~2.5GB = ~3.5GB)
 
 **Pro tip:** If you're running a desktop environment, you can free ~500MB by switching
 to text mode: `sudo systemctl set-default multi-user.target` then reboot. Switch back
@@ -182,16 +182,16 @@ sudo systemctl start ollama
 ollama --version
 ollama list
 
-# Pull MedGemma — try Q4 quantized (smallest, ~2.5GB)
+# Pull MedGemma 1.5 — try Q4 quantized (smallest, ~2.5GB)
 # Option A: From Unsloth GGUF (recommended)
-ollama pull hf.co/unsloth/medgemma-4b-it-GGUF:Q4_K_M
+ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M
 
 # Option B: If that doesn't work, try creating a Modelfile
 # First download the GGUF manually:
-# wget https://huggingface.co/unsloth/medgemma-4b-it-GGUF/resolve/main/medgemma-4b-it-Q4_K_M.gguf
+# wget https://huggingface.co/unsloth/medgemma-1.5-4b-it-GGUF/resolve/main/medgemma-1.5-4b-it-Q4_K_M.gguf
 
 # Then create a Modelfile:
-# echo 'FROM ./medgemma-4b-it-Q4_K_M.gguf' > Modelfile
+# echo 'FROM ./medgemma-1.5-4b-it-Q4_K_M.gguf' > Modelfile
 # ollama create medgemma -f Modelfile
 
 # Test it

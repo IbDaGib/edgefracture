@@ -304,7 +304,7 @@ Important: This is an AI screening result, not a diagnosis."""
             print("MedGemma not found in Ollama. Available models:")
             for m in models.get("models", []):
                 print(f"  {m['name']}")
-            return {"error": "MedGemma not found in Ollama", "note": "Run: ollama pull medgemma-4b-it"}
+            return {"error": "MedGemma not found in Ollama", "note": "Run: ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M"}
         
         print(f"Using model: {medgemma_model}")
         
@@ -444,7 +444,7 @@ def format_benchmark_table(cxr_results: dict, medgemma_results: dict, memory: di
         f"| Throughput | {_fmt(cxr_results.get('throughput_img_per_min'))} images/min |",
         f"| GPU memory | {_fmt(cxr_results.get('gpu_mem_peak_mb'))} MB |",
         "",
-        "### MedGemma 4B Q4 (Report Generation)",
+        "### MedGemma 1.5 4B Q4 (Report Generation)",
         "",
         "| Metric | Value |",
         "|--------|-------|",

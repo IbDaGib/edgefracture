@@ -121,7 +121,7 @@ brew install ollama
 ollama serve &
 
 # Pull MedGemma
-ollama pull hf.co/unsloth/medgemma-4b-it-GGUF:Q4_K_M
+ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M
 
 # Launch the app
 python app/app.py
@@ -241,7 +241,7 @@ print('CXR Foundation loaded on Jetson ✓')
 sudo systemctl start ollama
 
 # Pull MedGemma Q4
-ollama pull hf.co/unsloth/medgemma-4b-it-GGUF:Q4_K_M
+ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M
 
 # Test it
 ollama run medgemma "What is a Colles fracture? Two sentences."

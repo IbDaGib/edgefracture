@@ -41,7 +41,7 @@ fi
 
 echo "[5/6] Pulling MedGemma model..."
 # Try the Q4 quantized version first (fits in 8GB)
-ollama pull hf.co/unsloth/medgemma-4b-it-GGUF:Q4_K_M 2>/dev/null || \
+ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M 2>/dev/null || \
 ollama pull medgemma 2>/dev/null || \
 echo "WARNING: Could not pull MedGemma. You may need to manually download a GGUF."
 

@@ -59,9 +59,9 @@ The single biggest risk is CXR Foundation not loading properly.
 - [ ] Note: Even if zero-shot AUC is ~0.55, the linear probe should be much better
 
 ### Block 6: MedGemma Setup (1 hour)
-- [ ] Pull MedGemma: `ollama pull hf.co/unsloth/medgemma-4b-it-GGUF:Q4_K_M`
-- [ ] Test: `ollama run medgemma-4b-it "What is a Colles fracture?"`
-- [ ] If 4B is unstable → try `medgemma-1.5-4b-it` Q4 variant
+- [ ] Pull MedGemma: `ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M`
+- [ ] Test: `ollama run medgemma-1.5-4b-it "What is a Colles fracture?"`
+- [ ] Verify it fits in memory alongside CXR Foundation
 - [ ] Verify it fits in memory alongside CXR Foundation
 
 ---
