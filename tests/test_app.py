@@ -22,10 +22,12 @@ from app.app import (
     _build_audit_findings_section,
     _build_clinical_summary_section,
     _parse_json_response,
+    _normalize_clinical_structured_json,
     _render_structured_clinical,
     _render_structured_patient,
     _format_report_output,
     _compute_concordance,
+    _resolve_cxr_anchor_decision,
     _make_safety_audit_card,
     run_safety_audit,
     generate_report,
@@ -518,18 +520,24 @@ class TestRenderStructuredClinical:
 
     def test_full_fields(self):
         parsed = {
-            "primary_finding": "Suspected distal radius fracture",
+            "anchor_impression": "CXR anchor indicates high suspicion for distal radius fracture.",
+            "anatomic_location": "Distal radius",
+            "likely_fracture_pattern": "Colles-type extra-articular fracture",
             "urgency": "URGENT",
-            "recommendation": "Splint and refer to orthopedics",
-            "differential": "Colles fracture, Smith fracture",
-            "clinical_note": "Check for scaphoid tenderness",
+            "urgency_rationale": "High CXR probability with concordant cortical break finding.",
+            "immediate_actions": "Immobilize wrist and refer urgently.",
+            "recommended_imaging": "Orthogonal wrist radiographs; CT if articular extension suspected.",
+            "confidence_rationale": "Strong visual support for CXR anchor.",
+            "discordance_note": "",
         }
         result = _render_structured_clinical(parsed)
-        assert "Suspected distal radius fracture" in result
+        assert "CXR-Anchored Clinical Synthesis" in result
+        assert "Distal radius" in result
+        assert "Colles-type" in result
         assert "🔴 URGENT" in result
-        assert "Splint and refer" in result
-        assert "Colles fracture" in result
-        assert "scaphoid tenderness" in result
+        assert "Immobilize wrist" in result
+        assert "Orthogonal wrist radiographs" in result
+        assert "Strong visual support" in result
 
     def test_urgency_icons(self):
         for level, icon in [("URGENT", "🔴"), ("MODERATE", "🟡"), ("LOW", "🟢")]:
@@ -585,8 +593,10 @@ class TestFormatReportOutput:
             "structured_json": {"urgency": "LOW"},
             "latency_s": 2.5,
             "error": None,
+            "report_type": "clinical",
         }
         narrative, raw_json = _format_report_output(report)
+        assert "CXR-Anchored Clinical Report" in narrative
         assert "Some narrative text." in narrative
         assert "MedGemma 1.5 4B" in narrative
         assert "```json" in raw_json
@@ -698,7 +708,57 @@ class TestComputeConcordance:
 
 
 # ---------------------------------------------------------------------------
-# 12. Safety Audit Card rendering
+# 12. CXR soft-lock arbitration
+# ---------------------------------------------------------------------------
+
+class TestResolveCxrAnchorDecision:
+    """Test CXR-led soft-lock logic for final urgency/context."""
+
+    def test_concordant_high_probability_keeps_urgent(self):
+        classification = {"probability": 0.86, "triage_level": "HIGH SUSPICION"}
+        audit = {
+            "concordance": "CONCORDANT",
+            "support_level": "supports_cxr",
+            "visual_assessment": "fracture_likely",
+            "confidence_note": "Good quality image.",
+        }
+        resolved = _resolve_cxr_anchor_decision(classification, audit)
+        assert resolved["cxr_urgency"] == "URGENT"
+        assert resolved["final_urgency"] == "URGENT"
+        assert resolved["urgency_adjusted"] is False
+        assert resolved["tempered_confidence"] is False
+
+    def test_discordant_near_threshold_allows_one_level_downgrade(self):
+        classification = {"probability": 0.72, "triage_level": "HIGH SUSPICION"}
+        audit = {
+            "concordance": "DISCORDANT",
+            "support_level": "does_not_support_cxr",
+            "visual_assessment": "fracture_unlikely",
+            "confidence_note": "Adequate image quality.",
+        }
+        resolved = _resolve_cxr_anchor_decision(classification, audit)
+        assert resolved["cxr_urgency"] == "URGENT"
+        assert resolved["final_urgency"] == "MODERATE"
+        assert resolved["urgency_adjusted"] is True
+        assert resolved["tempered_confidence"] is True
+
+    def test_discordant_far_from_threshold_keeps_cxr_urgency(self):
+        classification = {"probability": 0.91, "triage_level": "HIGH SUSPICION"}
+        audit = {
+            "concordance": "DISCORDANT",
+            "support_level": "does_not_support_cxr",
+            "visual_assessment": "fracture_unlikely",
+            "confidence_note": "Adequate image quality.",
+        }
+        resolved = _resolve_cxr_anchor_decision(classification, audit)
+        assert resolved["cxr_urgency"] == "URGENT"
+        assert resolved["final_urgency"] == "URGENT"
+        assert resolved["urgency_adjusted"] is False
+        assert resolved["tempered_confidence"] is True
+
+
+# ---------------------------------------------------------------------------
+# 13. Safety Audit Card rendering
 # ---------------------------------------------------------------------------
 
 class TestSafetyAuditCard:
@@ -772,7 +832,7 @@ class TestSafetyAuditCard:
 
 
 # ---------------------------------------------------------------------------
-# 13. Safety Audit graceful degradation
+# 14. Safety Audit graceful degradation
 # ---------------------------------------------------------------------------
 
 class TestRunSafetyAuditGracefulDegradation:
@@ -793,9 +853,69 @@ class TestRunSafetyAuditGracefulDegradation:
         assert result["skipped"] is True
         assert "not available" in result["reason"].lower()
 
+    def test_prompt_contains_cxr_anchor_context(self, monkeypatch):
+        monkeypatch.setattr("app.app.SAFETY_AUDIT_ENABLED", True)
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        captured = {}
+
+        def fake_call(prompt, _img):
+            captured["prompt"] = prompt
+            return {
+                "response": (
+                    '{"visual_assessment":"fracture_likely","support_level":"supports_cxr",'
+                    '"suspected_location":"Distal radius","suspected_pattern":"Colles-type",'
+                    '"observations":["Cortical break"],"confidence_note":"Good quality",'
+                    '"reasoning":"Findings support anchor."}'
+                )
+            }
+
+        monkeypatch.setattr("app.app._call_medgemma_vision", fake_call)
+        img = Image.new("L", (256, 256), color=128)
+        result = run_safety_audit(
+            img,
+            {
+                "probability": 0.82,
+                "triage_level": "HIGH SUSPICION",
+                "body_region": "Hand",
+                "confidence": "high",
+            },
+        )
+        assert "CXR fracture probability anchor: 82.0%" in captured["prompt"]
+        assert "CXR triage anchor: HIGH SUSPICION" in captured["prompt"]
+        assert "CXR classification anchor: Fracture detected" in captured["prompt"]
+        assert result["support_level"] == "supports_cxr"
+        assert result["suspected_location"] == "Distal radius"
+        assert result["suspected_pattern"] == "Colles-type"
+
+    def test_missing_new_fields_fall_back_to_conservative_defaults(self, monkeypatch):
+        monkeypatch.setattr("app.app.SAFETY_AUDIT_ENABLED", True)
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        monkeypatch.setattr(
+            "app.app._call_medgemma_vision",
+            lambda _prompt, _img: {
+                "response": (
+                    '{"visual_assessment":"uncertain","observations":["Low contrast image"],'
+                    '"confidence_note":"Low quality","reasoning":"Limited evaluation."}'
+                )
+            },
+        )
+        img = Image.new("L", (256, 256), color=128)
+        result = run_safety_audit(
+            img,
+            {
+                "probability": 0.58,
+                "triage_level": "MODERATE SUSPICION",
+                "body_region": "Hip",
+                "confidence": "moderate",
+            },
+        )
+        assert result["support_level"] == "image_limited"
+        assert result["suspected_location"] == "Unspecified"
+        assert result["suspected_pattern"] == "Unspecified"
+
 
 # ---------------------------------------------------------------------------
-# 14. Build audit findings section
+# 15. Build audit findings section
 # ---------------------------------------------------------------------------
 
 class TestBuildAuditFindingsSection:
@@ -813,6 +933,9 @@ class TestBuildAuditFindingsSection:
             "visual_assessment": "fracture_likely",
             "concordance": "CONCORDANT",
             "reasoning": "Both models agree on fracture.",
+            "support_level": "supports_cxr",
+            "suspected_location": "Distal radius",
+            "suspected_pattern": "Colles-type",
             "observations": ["Cortical break in distal radius", "Soft tissue swelling"],
             "confidence_note": "Good image quality",
         }
@@ -824,6 +947,9 @@ class TestBuildAuditFindingsSection:
         assert "Cortical break" in result
         assert "Soft tissue swelling" in result
         assert "Good image quality" in result
+        assert "Support level" in result
+        assert "Suspected location" in result
+        assert "Suspected pattern" in result
 
     def test_error_audit_with_no_visual_returns_empty(self):
         """Audit that errored with no visual data returns empty."""
@@ -864,7 +990,7 @@ class TestBuildAuditFindingsSection:
 
 
 # ---------------------------------------------------------------------------
-# 15. Build clinical summary section
+# 16. Build clinical summary section
 # ---------------------------------------------------------------------------
 
 class TestBuildClinicalSummarySection:
@@ -931,21 +1057,49 @@ class TestBuildClinicalSummarySection:
         assert "translate" in result.lower() or "patient-friendly" in result.lower()
 
 
+class TestNormalizeClinicalStructuredJson:
+    """Verify new CXR-anchored schema maps to legacy keys."""
+
+    def test_maps_new_schema_to_legacy_fields(self):
+        parsed = {
+            "anchor_impression": "CXR anchor suggests distal radius fracture.",
+            "likely_fracture_pattern": "Colles-type fracture",
+            "immediate_actions": "Immobilize and urgent ortho review.",
+            "recommended_imaging": "Two-view wrist X-ray; CT if needed.",
+            "confidence_rationale": "Cortical break aligns with anchor.",
+            "discordance_note": "No major discordance.",
+        }
+        normalized = _normalize_clinical_structured_json(parsed)
+        assert normalized["primary_finding"] == parsed["anchor_impression"]
+        assert normalized["differential"] == parsed["likely_fracture_pattern"]
+        assert "Immobilize" in normalized["recommendation"]
+        assert "Two-view wrist X-ray" in normalized["recommendation"]
+        assert "Cortical break aligns" in normalized["clinical_note"]
+        assert "No major discordance" in normalized["clinical_note"]
+
+
 # ---------------------------------------------------------------------------
-# 16. generate_report with audit/clinical chaining
+# 17. generate_report with audit/clinical chaining
 # ---------------------------------------------------------------------------
 
 class TestGenerateReportWithAuditFindings:
-    """Verify audit context is kept out of JSON prompt but injected into narrative fallback."""
+    """Verify compact CXR anchor context is in clinical JSON prompt."""
 
-    def test_json_prompt_stays_clean(self, monkeypatch):
-        """JSON prompt should NOT contain audit data (keeps MedGemma 4B JSON-reliable)."""
+    def test_json_prompt_includes_anchor_context(self, monkeypatch):
+        """Clinical JSON prompt should include compact CXR anchor context."""
         captured_prompts = []
 
         def mock_call_medgemma(prompt):
             captured_prompts.append(prompt)
-            return {"response": '{"primary_finding": "Test", "urgency": "LOW", '
-                    '"recommendation": "None", "differential": "None", "clinical_note": ""}'}
+            return {"response": (
+                '{"anchor_impression":"CXR-led high suspicion for distal radius fracture.",'
+                '"anatomic_location":"Distal radius","likely_fracture_pattern":"Colles-type",'
+                '"urgency":"URGENT","urgency_rationale":"High CXR probability with visual support.",'
+                '"recommended_imaging":"Two-view wrist radiographs",'
+                '"immediate_actions":"Immobilize and urgent ortho review",'
+                '"confidence_rationale":"Cortical break aligns with CXR anchor.",'
+                '"discordance_note":"None"}'
+            )}
 
         monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
 
@@ -961,17 +1115,26 @@ class TestGenerateReportWithAuditFindings:
             "visual_assessment": "fracture_likely",
             "concordance": "CONCORDANT",
             "reasoning": "Both models agree.",
+            "support_level": "supports_cxr",
+            "suspected_location": "Distal radius",
+            "suspected_pattern": "Colles-type",
             "observations": ["Cortical break"],
             "confidence_note": "Good quality",
         }
 
         report = generate_report(result_dict, "", report_type="clinical", audit_result=audit)
 
-        # JSON succeeded (only 1 call), and the prompt was clean
+        # JSON succeeded (only 1 call) and includes compact anchor context
         assert len(captured_prompts) == 1
+        assert "CXR Anchor Context (primary signal)" in captured_prompts[0]
+        assert "Fracture probability anchor: 75.0%" in captured_prompts[0]
+        assert "Concordance: CONCORDANT" in captured_prompts[0]
+        assert "Support level: supports_cxr" in captured_prompts[0]
         assert "Cortical break" not in captured_prompts[0]
-        assert "Visual Safety Audit" not in captured_prompts[0]
         assert report["structured_json"] is not None
+        assert report["structured_json"]["primary_finding"].startswith("CXR-led")
+        assert "recommendation" in report["structured_json"]
+        assert "clinical_note" in report["structured_json"]
 
     def test_audit_findings_in_narrative_fallback(self, monkeypatch):
         """When JSON fails, narrative fallback prompt should contain audit data."""
@@ -1000,6 +1163,9 @@ class TestGenerateReportWithAuditFindings:
             "visual_assessment": "fracture_likely",
             "concordance": "CONCORDANT",
             "reasoning": "Both models agree.",
+            "support_level": "supports_cxr",
+            "suspected_location": "Distal radius",
+            "suspected_pattern": "Colles-type",
             "observations": ["Cortical break"],
             "confidence_note": "Good quality",
         }
@@ -1008,8 +1174,7 @@ class TestGenerateReportWithAuditFindings:
 
         # JSON failed, fell back to narrative (2 calls)
         assert len(captured_prompts) == 2
-        # First call (JSON) was clean
-        assert "Cortical break" not in captured_prompts[0]
+        assert "CXR Anchor Context (primary signal)" in captured_prompts[0]
         # Second call (narrative) has audit context
         assert "Cortical break" in captured_prompts[1]
         assert "Visual Safety Audit" in captured_prompts[1]
@@ -1175,7 +1340,7 @@ class TestGenerateReportWithClinicalSummary:
 
 
 # ---------------------------------------------------------------------------
-# 17. MedGemma region detection
+# 18. MedGemma region detection
 # ---------------------------------------------------------------------------
 
 class TestDetectRegionMedgemma:

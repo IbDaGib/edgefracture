@@ -42,6 +42,7 @@ SAFETY_AUDIT_TIMEOUT = int(os.environ.get("SAFETY_AUDIT_TIMEOUT", "180"))
 
 TRIAGE_THRESHOLDS = {"red": 0.70, "yellow": 0.40}
 VALIDATED_REGIONS = {"Hand", "Leg", "Hip", "Shoulder"}
+CXR_SOFT_LOCK_MARGIN = float(os.environ.get("CXR_SOFT_LOCK_MARGIN", "0.05"))
 
 LINEAR_PROBE_PATH = os.environ.get(
     "PROBE_PATH", "results/linear_probe/fracture_probe.joblib"
@@ -510,18 +511,23 @@ has analyzed a {body_region} X-ray and produced the following results:
 - Fracture probability: {score_pct}% ({triage_level})
 - Classification: {classification}
 - Confidence: {confidence}
-{clinical_context_section}{audit_findings_section}
+{anchor_context_section}{clinical_context_section}{audit_findings_section}
 Provide a CLINICAL SUMMARY for the reviewing physician:
 
-1. Describe what this screening result suggests (2-3 sentences), including \
-possible fracture types common in this body region.
+1. Provide a CXR-anchored impression (2-3 sentences). Use CXR probability as \
+the primary anchor and use visual findings to support/temper confidence.
 
-2. URGENCY LEVEL — classify as one of:
+2. Include specific diagnostic detail:
+   - most likely anatomic location of injury
+   - likely fracture pattern/type for this body region
+
+3. URGENCY LEVEL — classify as one of:
    - URGENT: Likely displaced or unstable fracture — splint and refer immediately
    - MODERATE: Possible non-displaced fracture — further imaging recommended
    - LOW: Low suspicion — clinical correlation advised
 
-3. Recommended next steps (imaging, referral, follow-up).
+4. Provide urgency rationale and recommended next steps \
+(imaging, referral, follow-up).
 
 Be concise and clinical. This is an AI screening result, not a diagnosis."""
 
@@ -547,14 +553,21 @@ has analyzed a {body_region} X-ray and produced the following results:
 - Fracture probability: {score_pct}% ({triage_level})
 - Classification: {classification}
 - Confidence: {confidence}
-{clinical_context_section}{audit_findings_section}
+{anchor_context_section}{clinical_context_section}
+Use CXR probability/classification as the primary anchor. If visual findings are discordant \
+or image quality is limited, keep the CXR-anchored impression but temper confidence/urgency rationale.
+
 Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) using this exact schema:
 
-{{"primary_finding": "1-2 sentence clinical summary of what the screening suggests",\
+{{"anchor_impression": "1-2 sentence CXR-anchored clinical impression",\
+ "anatomic_location": "Most likely anatomic injury location",\
+ "likely_fracture_pattern": "Most likely fracture pattern/type for this region",\
  "urgency": "URGENT | MODERATE | LOW",\
- "recommendation": "Recommended next steps (imaging, referral, follow-up)",\
- "differential": "Possible fracture types for this body region",\
- "clinical_note": "Any additional clinical considerations"}}"""
+ "urgency_rationale": "Why this urgency follows from CXR anchor plus visual support/limitations",\
+ "recommended_imaging": "Specific imaging recommendation",\
+ "immediate_actions": "Immediate clinical actions",\
+ "confidence_rationale": "Why confidence is high/moderate/tempered",\
+ "discordance_note": "Brief note on concordance/discordance or image limitations"}}"""
 
 PATIENT_JSON_PROMPT = """\
 You are a friendly medical assistant explaining an X-ray screening result \
@@ -573,10 +586,13 @@ Respond with ONLY a valid JSON object (no markdown, no code fences, no extra tex
 SAFETY_AUDIT_PROMPT = """\
 You are a musculoskeletal radiology assistant performing a visual safety audit \
 of an X-ray image. A separate AI system (CXR Foundation) has already provided \
-a numeric fracture probability. Your job is to independently assess the image \
-for fracture indicators.
+a numeric fracture probability. Use that CXR output as the primary anchor, then \
+evaluate whether the image visually supports or limits that anchor.
 
 Body region: {body_region}
+CXR fracture probability anchor: {cxr_probability_pct}%
+CXR triage anchor: {cxr_triage_level}
+CXR classification anchor: {cxr_classification}
 
 Analyze this X-ray image and look for:
 - Cortical breaks or discontinuities
@@ -589,6 +605,9 @@ Respond with ONLY a valid JSON object (no markdown, no code fences, no extra tex
 using this exact schema:
 
 {{"visual_assessment": "fracture_likely | fracture_unlikely | uncertain",\
+ "support_level": "supports_cxr | partially_supports_cxr | does_not_support_cxr | image_limited",\
+ "suspected_location": "specific anatomic location if visible, else Unspecified",\
+ "suspected_pattern": "likely fracture pattern if visible, else Unspecified",\
  "observations": ["list of specific findings observed in the image"],\
  "confidence_note": "brief note on image quality or limitations",\
  "reasoning": "1-2 sentence explanation of your assessment"}}
@@ -617,7 +636,9 @@ Forearm, Shoulder, Humerus, Spine, Ribs, Hip, Pelvis, Knee, Leg, Ankle, Foot)
 - If you cannot determine the region, respond: {{"region": "Unknown"}}"""
 
 STRUCTURED_JSON_FIELDS_CLINICAL = [
-    "primary_finding", "urgency", "recommendation", "differential", "clinical_note",
+    "anchor_impression", "anatomic_location", "likely_fracture_pattern", "urgency",
+    "urgency_rationale", "recommended_imaging", "immediate_actions",
+    "confidence_rationale", "discordance_note",
 ]
 STRUCTURED_JSON_FIELDS_PATIENT = ["summary", "next_steps", "reassurance"]
 
@@ -677,6 +698,9 @@ def _build_audit_findings_section(audit_result: dict | None) -> str:
     reasoning = audit_result.get("reasoning", "")
     observations = audit_result.get("observations", [])
     confidence_note = audit_result.get("confidence_note", "")
+    support_level = audit_result.get("support_level", "")
+    suspected_location = audit_result.get("suspected_location", "")
+    suspected_pattern = audit_result.get("suspected_pattern", "")
 
     # If there's nothing useful, return empty
     if not visual and not observations:
@@ -687,6 +711,12 @@ def _build_audit_findings_section(audit_result: dict | None) -> str:
         lines.append(f"- Visual assessment: {visual}")
     if concordance and reasoning:
         lines.append(f"- Cross-check result: {concordance} — {reasoning}")
+    if support_level:
+        lines.append(f"- Support level: {support_level}")
+    if suspected_location:
+        lines.append(f"- Suspected location: {suspected_location}")
+    if suspected_pattern:
+        lines.append(f"- Suspected pattern: {suspected_pattern}")
     if observations:
         lines.append("- Observations:")
         for obs in observations[:5]:
@@ -709,6 +739,7 @@ def _build_clinical_summary_section(clinical_report: dict | None) -> str:
 
     parsed = clinical_report.get("structured_json")
     if parsed:
+        parsed = _normalize_clinical_structured_json(parsed)
         lines = [
             "\nClinical AI Summary (use as the basis for your explanation — "
             "translate into patient-friendly language):"
@@ -721,6 +752,8 @@ def _build_clinical_summary_section(clinical_report: dict | None) -> str:
             lines.append(f"- Recommendation: {parsed['recommendation']}")
         if parsed.get("differential"):
             lines.append(f"- Differential: {parsed['differential']}")
+        if parsed.get("clinical_note"):
+            lines.append(f"- Clinical note: {parsed['clinical_note']}")
         lines.append("")
         return "\n".join(lines)
 
@@ -763,22 +796,226 @@ def _parse_json_response(raw: str) -> dict | None:
     return None
 
 
+def _normalize_support_level(value: str) -> str:
+    """Normalize MedGemma support-level label to an allowed enum."""
+    allowed = {
+        "supports_cxr",
+        "partially_supports_cxr",
+        "does_not_support_cxr",
+        "image_limited",
+    }
+    if not value:
+        return "image_limited"
+    normalized = str(value).strip().lower()
+    return normalized if normalized in allowed else "image_limited"
+
+
+def _resolve_cxr_anchor_decision(
+    classification_result: dict,
+    audit_result: dict | None,
+    threshold_margin: float = CXR_SOFT_LOCK_MARGIN,
+) -> dict:
+    """Resolve final urgency using a CXR-led soft-lock policy."""
+    prob = float(classification_result.get("probability", 0.5))
+
+    if prob >= TRIAGE_THRESHOLDS["red"]:
+        cxr_urgency = "URGENT"
+    elif prob >= TRIAGE_THRESHOLDS["yellow"]:
+        cxr_urgency = "MODERATE"
+    else:
+        cxr_urgency = "LOW"
+
+    support_level = _normalize_support_level(
+        (audit_result or {}).get("support_level", "")
+    )
+    concordance = (audit_result or {}).get("concordance", "UNCERTAIN")
+    visual_assessment = str((audit_result or {}).get("visual_assessment", "")).strip().lower()
+    confidence_note = str((audit_result or {}).get("confidence_note", "")).lower()
+
+    image_limited = (
+        support_level == "image_limited"
+        or visual_assessment == "uncertain"
+        or "poor" in confidence_note
+        or "limited" in confidence_note
+        or "low quality" in confidence_note
+    )
+    discordant = (
+        concordance == "DISCORDANT"
+        or support_level == "does_not_support_cxr"
+    )
+    tempered_confidence = discordant or image_limited or concordance == "UNCERTAIN"
+
+    near_threshold = any(
+        abs(prob - threshold) <= threshold_margin
+        for threshold in TRIAGE_THRESHOLDS.values()
+    )
+
+    downgrade_map = {"URGENT": "MODERATE", "MODERATE": "LOW", "LOW": "LOW"}
+    urgency_adjusted = tempered_confidence and near_threshold and cxr_urgency != "LOW"
+    final_urgency = downgrade_map[cxr_urgency] if urgency_adjusted else cxr_urgency
+
+    if discordant:
+        discordance_note = (
+            "Visual audit is discordant with the CXR anchor; confidence is tempered."
+        )
+    elif image_limited:
+        discordance_note = (
+            "Visual audit is image-limited/uncertain; confidence is tempered."
+        )
+    elif concordance == "UNCERTAIN":
+        discordance_note = (
+            "Cross-check is uncertain; maintain CXR anchor with tempered confidence."
+        )
+    else:
+        discordance_note = "Visual audit supports the CXR anchor."
+
+    return {
+        "cxr_probability_pct": round(prob * 100, 1),
+        "classification_anchor": (
+            "Fracture detected" if prob >= 0.5 else "No fracture detected"
+        ),
+        "cxr_urgency": cxr_urgency,
+        "final_urgency": final_urgency,
+        "urgency_adjusted": urgency_adjusted,
+        "tempered_confidence": tempered_confidence,
+        "support_level": support_level,
+        "concordance": concordance,
+        "discordance_note": discordance_note,
+    }
+
+
+def _build_cxr_anchor_section(
+    classification_result: dict,
+    anchor_context: dict | None,
+    audit_result: dict | None = None,
+) -> str:
+    """Build compact CXR anchor context for clinical prompts."""
+    if not anchor_context:
+        return ""
+
+    location = (
+        (audit_result or {}).get("suspected_location", "")
+        or "Unspecified"
+    )
+    pattern = (
+        (audit_result or {}).get("suspected_pattern", "")
+        or "Unspecified"
+    )
+
+    lines = [
+        "\nCXR Anchor Context (primary signal):",
+        f"- Fracture probability anchor: {anchor_context['cxr_probability_pct']}%",
+        f"- CXR triage level: {classification_result.get('triage_level', 'Unknown')}",
+        f"- Classification anchor: {anchor_context['classification_anchor']}",
+        f"- CXR urgency anchor: {anchor_context['cxr_urgency']}",
+        f"- Final urgency policy output: {anchor_context['final_urgency']}",
+        f"- Concordance: {anchor_context.get('concordance', 'UNCERTAIN')}",
+        f"- Support level: {anchor_context.get('support_level', 'image_limited')}",
+        f"- Suspected location: {location}",
+        f"- Suspected pattern: {pattern}",
+        f"- Discordance note: {anchor_context.get('discordance_note', '')}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _normalize_clinical_structured_json(
+    parsed: dict,
+    anchor_context: dict | None = None,
+) -> dict:
+    """Map new clinical schema fields to legacy keys for compatibility."""
+    if not isinstance(parsed, dict):
+        return {}
+
+    normalized = dict(parsed)
+
+    # Forward fill new fields from legacy payloads (if model returns old schema)
+    if not normalized.get("anchor_impression") and normalized.get("primary_finding"):
+        normalized["anchor_impression"] = normalized["primary_finding"]
+    if not normalized.get("likely_fracture_pattern") and normalized.get("differential"):
+        normalized["likely_fracture_pattern"] = normalized["differential"]
+    if not normalized.get("immediate_actions") and normalized.get("recommendation"):
+        normalized["immediate_actions"] = normalized["recommendation"]
+    if not normalized.get("confidence_rationale") and normalized.get("clinical_note"):
+        normalized["confidence_rationale"] = normalized["clinical_note"]
+    if not normalized.get("urgency") and anchor_context:
+        normalized["urgency"] = anchor_context.get("final_urgency", "")
+
+    # Backward compatibility fields used by downstream chaining
+    if not normalized.get("primary_finding") and normalized.get("anchor_impression"):
+        normalized["primary_finding"] = normalized["anchor_impression"]
+    if not normalized.get("differential") and normalized.get("likely_fracture_pattern"):
+        normalized["differential"] = normalized["likely_fracture_pattern"]
+
+    if not normalized.get("recommendation"):
+        recommendation_parts = []
+        if normalized.get("immediate_actions"):
+            recommendation_parts.append(str(normalized["immediate_actions"]).strip())
+        if normalized.get("recommended_imaging"):
+            recommendation_parts.append(
+                f"Imaging: {str(normalized['recommended_imaging']).strip()}"
+            )
+        recommendation = " ".join(p for p in recommendation_parts if p).strip()
+        if recommendation:
+            normalized["recommendation"] = recommendation
+
+    if not normalized.get("clinical_note"):
+        note_parts = []
+        if normalized.get("confidence_rationale"):
+            note_parts.append(str(normalized["confidence_rationale"]).strip())
+        discordance_note = (
+            normalized.get("discordance_note")
+            or (anchor_context or {}).get("discordance_note", "")
+        )
+        if discordance_note:
+            note_parts.append(str(discordance_note).strip())
+        clinical_note = " ".join(p for p in note_parts if p).strip()
+        if clinical_note:
+            normalized["clinical_note"] = clinical_note
+
+    return normalized
+
+
 def _render_structured_clinical(parsed: dict) -> str:
     """Render parsed clinical JSON into a readable markdown report."""
+    parsed = _normalize_clinical_structured_json(parsed)
+
     lines = []
-    if parsed.get("primary_finding"):
-        lines.append(f"**Finding:** {parsed['primary_finding']}")
+    lines.append("**CXR-Anchored Clinical Synthesis**")
+
+    if parsed.get("anchor_impression") or parsed.get("primary_finding"):
+        lines.append(
+            f"**Impression:** {parsed.get('anchor_impression') or parsed.get('primary_finding')}"
+        )
+    if parsed.get("anatomic_location"):
+        lines.append(f"**Anatomic Location:** {parsed['anatomic_location']}")
+    if parsed.get("likely_fracture_pattern") or parsed.get("differential"):
+        lines.append(
+            f"**Likely Pattern:** {parsed.get('likely_fracture_pattern') or parsed.get('differential')}"
+        )
     if parsed.get("urgency"):
         urgency = parsed["urgency"].upper()
         icon = {"URGENT": "🔴", "MODERATE": "🟡", "LOW": "🟢"}.get(urgency, "⚪")
         lines.append(f"**Urgency:** {icon} {urgency}")
-    if parsed.get("differential"):
-        lines.append(f"**Differential:** {parsed['differential']}")
-    if parsed.get("recommendation"):
+    if parsed.get("urgency_rationale"):
+        lines.append(f"**Urgency Rationale:** {parsed['urgency_rationale']}")
+    if parsed.get("immediate_actions"):
+        lines.append(f"**Immediate Actions:** {parsed['immediate_actions']}")
+    if parsed.get("recommended_imaging"):
+        lines.append(f"**Recommended Imaging:** {parsed['recommended_imaging']}")
+    if parsed.get("confidence_rationale"):
+        lines.append(f"**Confidence Rationale:** {parsed['confidence_rationale']}")
+    if parsed.get("discordance_note"):
+        lines.append(f"**Discordance Note:** {parsed['discordance_note']}")
+
+    # Legacy fallback lines (if model emits old schema)
+    if parsed.get("recommendation") and not parsed.get("immediate_actions"):
         lines.append(f"**Recommendation:** {parsed['recommendation']}")
-    if parsed.get("clinical_note"):
+    if parsed.get("clinical_note") and not parsed.get("confidence_rationale"):
         lines.append(f"**Note:** {parsed['clinical_note']}")
-    return "\n\n".join(lines)
+
+    rendered = "\n\n".join(line for line in lines if line)
+    return rendered if rendered.strip() != "**CXR-Anchored Clinical Synthesis**" else ""
 
 
 def _render_structured_patient(parsed: dict) -> str:
@@ -917,6 +1154,19 @@ def generate_report(
       - clinical_summary: clinical report dict, injected into patient prompts
     """
     prob = classification_result["probability"]
+    anchor_context = None
+    if report_type == "clinical":
+        anchor_context = _resolve_cxr_anchor_decision(
+            classification_result, audit_result,
+        )
+
+    anchor_context_section = (
+        _build_cxr_anchor_section(
+            classification_result, anchor_context, audit_result,
+        )
+        if report_type == "clinical"
+        else ""
+    )
     context_section = _build_context_section(clinical_context)
     audit_section = _build_audit_findings_section(audit_result) if report_type == "clinical" else ""
     clinical_section = _build_clinical_summary_section(clinical_summary) if report_type == "patient" else ""
@@ -929,6 +1179,7 @@ def generate_report(
         triage_level=classification_result["triage_level"],
         classification="Fracture detected" if prob >= 0.5 else "No fracture detected",
         confidence=classification_result["confidence"],
+        anchor_context_section=anchor_context_section,
         clinical_context_section=context_section,
         audit_findings_section="",
         clinical_summary_section="",
@@ -954,6 +1205,10 @@ def generate_report(
         parsed = _parse_json_response(raw_response)
 
         if parsed is not None:
+            if report_type == "clinical":
+                parsed = _normalize_clinical_structured_json(
+                    parsed, anchor_context=anchor_context,
+                )
             # Structured output succeeded — render into narrative
             report_text = render_fn(parsed)
         else:
@@ -972,6 +1227,8 @@ def generate_report(
             "structured_json": parsed,
             "latency_s": round(latency, 1),
             "error": None,
+            "report_type": report_type,
+            "anchor_context": anchor_context,
         }
 
     except requests.ConnectionError:
@@ -980,6 +1237,8 @@ def generate_report(
             "structured_json": None,
             "latency_s": 0,
             "error": "Cannot connect to Ollama. Start with: ollama serve",
+            "report_type": report_type,
+            "anchor_context": anchor_context,
         }
     except requests.Timeout:
         return {
@@ -987,6 +1246,8 @@ def generate_report(
             "structured_json": None,
             "latency_s": round(time.time() - start, 1),
             "error": "MedGemma timed out (>120s).",
+            "report_type": report_type,
+            "anchor_context": anchor_context,
         }
     except Exception as e:
         return {
@@ -994,6 +1255,8 @@ def generate_report(
             "structured_json": None,
             "latency_s": round(time.time() - start, 1),
             "error": f"MedGemma error: {str(e)}",
+            "report_type": report_type,
+            "anchor_context": anchor_context,
         }
 
 
@@ -1124,8 +1387,17 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
 
     start = time.time()
     try:
+        prob = float(classification_result.get("probability", 0.5))
+        triage_level = classification_result.get("triage_level", "UNKNOWN")
+        cxr_classification = (
+            "Fracture detected" if prob >= 0.5 else "No fracture detected"
+        )
+
         prompt = SAFETY_AUDIT_PROMPT.format(
             body_region=classification_result.get("body_region", "Unknown"),
+            cxr_probability_pct=round(prob * 100, 1),
+            cxr_triage_level=triage_level,
+            cxr_classification=cxr_classification,
         )
         data = _call_medgemma_vision(prompt, image)
         raw_response = data.get("response", "").strip()
@@ -1136,6 +1408,9 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
             observations = []
             confidence_note = "MedGemma returned non-JSON response"
             reasoning = raw_response[:200] if raw_response else "No response"
+            support_level = "image_limited"
+            suspected_location = "Unspecified"
+            suspected_pattern = "Unspecified"
         else:
             visual_assessment = parsed.get("visual_assessment", "uncertain")
             observations = parsed.get("observations", [])
@@ -1143,6 +1418,9 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
                 observations = []
             confidence_note = parsed.get("confidence_note", "")
             reasoning = parsed.get("reasoning", "")
+            support_level = _normalize_support_level(parsed.get("support_level", ""))
+            suspected_location = str(parsed.get("suspected_location", "")).strip() or "Unspecified"
+            suspected_pattern = str(parsed.get("suspected_pattern", "")).strip() or "Unspecified"
 
         concordance_result = _compute_concordance(
             classification_result["probability"],
@@ -1157,6 +1435,9 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
             "visual_assessment": visual_assessment,
             "observations": observations,
             "confidence_note": confidence_note,
+            "support_level": support_level,
+            "suspected_location": suspected_location,
+            "suspected_pattern": suspected_pattern,
             "reasoning": concordance_result["reasoning"],
             "vision_reasoning": reasoning,
             "latency_s": latency,
@@ -1167,6 +1448,9 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
             "skipped": False,
             "concordance": "UNCERTAIN",
             "observations": [],
+            "support_level": "image_limited",
+            "suspected_location": "Unspecified",
+            "suspected_pattern": "Unspecified",
             "reasoning": "Cannot connect to Ollama for vision analysis.",
             "latency_s": round(time.time() - start, 1),
             "error": "Connection refused — is Ollama running?",
@@ -1176,6 +1460,9 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
             "skipped": False,
             "concordance": "UNCERTAIN",
             "observations": [],
+            "support_level": "image_limited",
+            "suspected_location": "Unspecified",
+            "suspected_pattern": "Unspecified",
             "reasoning": (
                 f"MedGemma vision timed out (>{SAFETY_AUDIT_TIMEOUT}s)."
             ),
@@ -1187,6 +1474,9 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
             "skipped": False,
             "concordance": "UNCERTAIN",
             "observations": [],
+            "support_level": "image_limited",
+            "suspected_location": "Unspecified",
+            "suspected_pattern": "Unspecified",
             "reasoning": f"Safety audit error: {str(e)}",
             "latency_s": round(time.time() - start, 1),
             "error": str(e),
@@ -1539,7 +1829,11 @@ def _format_report_output(report: dict) -> tuple[str, str]:
     if report["error"]:
         return f"⚠️ {report['error']}", ""
 
-    narrative = report["report_text"] + (
+    header = ""
+    if report.get("report_type") == "clinical":
+        header = "**CXR-Anchored Clinical Report**\n\n"
+
+    narrative = header + report["report_text"] + (
         f"\n\n---\n*Generated by MedGemma 1.5 4B in {report['latency_s']}s*"
     )
 
