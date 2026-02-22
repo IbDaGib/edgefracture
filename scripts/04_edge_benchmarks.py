@@ -378,25 +378,34 @@ def benchmark_combined_pipeline() -> dict:
 
 def profile_memory() -> dict:
     """Profile system and GPU memory usage."""
-    import torch
-    
     mem = psutil.virtual_memory()
     result = {
         "system_ram_total_gb": round(mem.total / (1024**3), 2),
         "system_ram_used_gb": round(mem.used / (1024**3), 2),
         "system_ram_available_gb": round(mem.available / (1024**3), 2),
     }
-    
-    if torch.cuda.is_available():
-        result["gpu_name"] = torch.cuda.get_device_name(0)
-        result["gpu_mem_total_mb"] = round(torch.cuda.get_device_properties(0).total_mem / (1024**2))
-        result["gpu_mem_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024**2))
-        result["gpu_mem_reserved_mb"] = round(torch.cuda.memory_reserved() / (1024**2))
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        result["gpu_name"] = "Apple Silicon (MPS)"
-        result["gpu_mem_allocated_mb"] = round(torch.mps.current_allocated_memory() / (1024**2))
-        result["note"] = "MPS uses unified memory — see system RAM for total"
-    
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            result["gpu_name"] = torch.cuda.get_device_name(0)
+            result["gpu_mem_total_mb"] = round(torch.cuda.get_device_properties(0).total_mem / (1024**2))
+            result["gpu_mem_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024**2))
+            result["gpu_mem_reserved_mb"] = round(torch.cuda.memory_reserved() / (1024**2))
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            result["gpu_name"] = "Apple Silicon (MPS)"
+            result["gpu_mem_allocated_mb"] = round(torch.mps.current_allocated_memory() / (1024**2))
+            result["note"] = "MPS uses unified memory — see system RAM for total"
+    except ImportError:
+        try:
+            import tensorflow as tf
+            gpus = tf.config.list_physical_devices("GPU")
+            if gpus:
+                result["gpu_name"] = gpus[0].name
+                result["note"] = "GPU detected via TensorFlow"
+        except ImportError:
+            pass
+
     return result
 
 
@@ -404,9 +413,19 @@ def profile_memory() -> dict:
 # Results Formatting
 # ============================================================
 
+def _fmt(value, spec: str = ".0f") -> str:
+    """Safely format a numeric value, returning 'N/A' for non-numeric inputs."""
+    if value is None or value == "N/A":
+        return "N/A"
+    try:
+        return f"{float(value):{spec}}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
 def format_benchmark_table(cxr_results: dict, medgemma_results: dict, memory: dict) -> str:
     """Format results into a markdown table for the writeup."""
-    
+
     lines = [
         "## Edge Deployment Benchmarks — Jetson Orin Nano 8GB",
         "",
@@ -419,11 +438,11 @@ def format_benchmark_table(cxr_results: dict, medgemma_results: dict, memory: di
         "",
         "| Metric | Value |",
         "|--------|-------|",
-        f"| Mean latency | {cxr_results.get('mean_latency_ms', 'N/A'):.0f} ms |",
-        f"| Median latency | {cxr_results.get('median_latency_ms', 'N/A'):.0f} ms |",
-        f"| P95 latency | {cxr_results.get('p95_latency_ms', 'N/A'):.0f} ms |",
-        f"| Throughput | {cxr_results.get('throughput_img_per_min', 'N/A'):.0f} images/min |",
-        f"| GPU memory | {cxr_results.get('gpu_mem_peak_mb', 'N/A'):.0f} MB |",
+        f"| Mean latency | {_fmt(cxr_results.get('mean_latency_ms'))} ms |",
+        f"| Median latency | {_fmt(cxr_results.get('median_latency_ms'))} ms |",
+        f"| P95 latency | {_fmt(cxr_results.get('p95_latency_ms'))} ms |",
+        f"| Throughput | {_fmt(cxr_results.get('throughput_img_per_min'))} images/min |",
+        f"| GPU memory | {_fmt(cxr_results.get('gpu_mem_peak_mb'))} MB |",
         "",
         "### MedGemma 4B Q4 (Report Generation)",
         "",
@@ -433,9 +452,9 @@ def format_benchmark_table(cxr_results: dict, medgemma_results: dict, memory: di
     
     if "error" not in medgemma_results:
         lines.extend([
-            f"| Mean latency | {medgemma_results.get('mean_latency_s', 'N/A'):.1f} s |",
-            f"| Tokens/sec | {medgemma_results.get('mean_tokens_per_sec', 'N/A'):.1f} |",
-            f"| Mean output tokens | {medgemma_results.get('mean_tokens', 'N/A'):.0f} |",
+            f"| Mean latency | {_fmt(medgemma_results.get('mean_latency_s'), '.1f')} s |",
+            f"| Tokens/sec | {_fmt(medgemma_results.get('mean_tokens_per_sec'), '.1f')} |",
+            f"| Mean output tokens | {_fmt(medgemma_results.get('mean_tokens'))} |",
         ])
     else:
         lines.append(f"| Status | {medgemma_results.get('error', 'Not tested')} |")

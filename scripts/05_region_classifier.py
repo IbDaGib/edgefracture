@@ -108,7 +108,7 @@ def main():
     with open(OUTPUT_DIR / "region_classifier_results.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\n✓ Done — use region_classifier.pkl alongside fracture_probe.pkl")
+    print(f"\n✓ Done — use region_classifier.joblib alongside fracture_probe.joblib")
 
 if __name__ == "__main__":
     main()

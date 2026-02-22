@@ -89,7 +89,7 @@ def organize_dataset(raw_dir: Path):
             body_region = classify_body_region(fname)
             records.append({
                 "image_id": img["id"],
-                "file_name": fname,
+                "file_path": fname,
                 "body_region": body_region,
                 "has_fracture": 1 if img["id"] in fractured_ids else 0,
                 "width": img.get("width", 0),
@@ -140,7 +140,8 @@ def create_labels_from_directory(raw_dir: Path):
             body_region = classify_body_region(str(img_path))
             
             records.append({
-                "file_name": str(img_path.relative_to(raw_dir)),
+                "image_id": img_path.stem,
+                "file_path": str(img_path.relative_to(raw_dir)),
                 "body_region": body_region,
                 "has_fracture": has_fracture,
             })

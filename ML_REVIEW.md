@@ -174,5 +174,76 @@ Overall this is a well-structured competition project with a compelling transfer
 | 16 | **Low** | Pin dependency upper bounds | ~~FIXED~~ |
 | 17 | **Low** | Mark dead classifier_real.py as deprecated | ~~FIXED~~ |
 | 18 | **Low** | Add noqa + comment for side-effect import | ~~FIXED~~ |
+| 19 | **Critical** | Rename `file_name` to `file_path`, add `image_id` | ~~FIXED~~ |
+| 20 | **High** | Add `_fmt()` helper for safe numeric formatting | ~~FIXED~~ |
+| 21 | **High** | Add `tensorflow-text` to requirements.txt | ~~FIXED~~ |
+| 22 | **Medium** | Filter invalid embeddings in zero-shot script | ~~FIXED~~ |
+| 23 | **Medium** | Wrap torch import in try/except, add TF fallback | ~~FIXED~~ |
+| 24 | **Low** | Fix `.pkl` → `.joblib` typo in print | ~~FIXED~~ |
 
-**18 of 18 issues fixed.**
+**24 of 24 issues fixed.**
+
+---
+
+## NEW ISSUES (Round 2)
+
+### ~~19. Column mismatch breaks pipeline from scratch~~ FIXED
+
+**File:** `scripts/download_fracatlas.py:92,142-146`
+
+~~`organize_dataset()` writes `file_name` but `01_extract_embeddings.py` expects `file_path` and `image_id`. Running the pipeline from a fresh download fails immediately.~~
+
+**Fix applied:** Renamed `file_name` to `file_path` in both `organize_dataset()` and `create_labels_from_directory()`. Added missing `image_id` field to fallback path.
+
+### ~~20. `format_benchmark_table` crashes on missing metrics~~ FIXED
+
+**File:** `scripts/04_edge_benchmarks.py:422-438`
+
+~~F-string format specs like `:.0f` crash with `TypeError` when the dict `.get()` returns the default `'N/A'` string.~~
+
+**Fix applied:** Added `_fmt()` helper that safely formats numeric values or returns `'N/A'`. All format specs in the table replaced with `_fmt()` calls.
+
+### ~~21. Missing `tensorflow-text` in requirements.txt~~ FIXED
+
+**File:** `requirements.txt`
+
+~~Fresh installs fail because `tensorflow-text` is imported by the CXR Foundation pipeline but not listed as a dependency.~~
+
+**Fix applied:** Added `tensorflow-text>=2.16.0,<3.0.0` after the `tensorflow` line.
+
+### ~~22. Zero-shot doesn't filter invalid embeddings~~ FIXED
+
+**File:** `scripts/02_zero_shot.py:~435`
+
+~~Zero-vector embeddings (from failed extractions, see issue #9) are included in cosine similarity computation, biasing results.~~
+
+**Fix applied:** After loading embeddings, loads `contrastive_valid_mask.npy` and filters out invalid entries. Prints count of filtered entries; warns if mask file is missing.
+
+### ~~23. `profile_memory()` imports torch unconditionally~~ FIXED
+
+**File:** `scripts/04_edge_benchmarks.py:379-400`
+
+~~`import torch` at the top of `profile_memory()` crashes on TensorFlow-only environments (e.g., Jetson with only TF installed).~~
+
+**Fix applied:** Wrapped `import torch` in `try/except ImportError`. Added TensorFlow GPU detection as fallback. System RAM stats via psutil are always returned.
+
+### ~~24. `.pkl` typo in region classifier print~~ FIXED
+
+**File:** `scripts/05_region_classifier.py:111`
+
+~~Print statement says `.pkl` but the model is saved as `.joblib`.~~
+
+**Fix applied:** Changed `.pkl` to `.joblib` in the print string.
+
+---
+
+## Summary (Round 2)
+
+| # | Severity | Fix | Status |
+|---|----------|-----|--------|
+| 19 | **Critical** | Rename `file_name` to `file_path`, add `image_id` | ~~FIXED~~ |
+| 20 | **High** | Add `_fmt()` helper for safe numeric formatting | ~~FIXED~~ |
+| 21 | **High** | Add `tensorflow-text` to requirements.txt | ~~FIXED~~ |
+| 22 | **Medium** | Filter invalid embeddings in zero-shot script | ~~FIXED~~ |
+| 23 | **Medium** | Wrap torch import in try/except, add TF fallback | ~~FIXED~~ |
+| 24 | **Low** | Fix `.pkl` → `.joblib` typo in print | ~~FIXED~~ |

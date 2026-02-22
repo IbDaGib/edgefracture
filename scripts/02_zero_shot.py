@@ -435,6 +435,22 @@ def main():
     print(f"Loaded {len(embeddings)} image embeddings: {emb_type}")
     print(f"  Shape: {embeddings.shape}")
 
+    # Filter out invalid (zero-vector) embeddings using the validity mask
+    if emb_type.startswith("contrastive"):
+        valid_mask_path = args.embeddings_dir / "contrastive_valid_mask.npy"
+    else:
+        valid_mask_path = args.embeddings_dir / "valid_mask.npy"
+
+    if valid_mask_path.exists():
+        valid_mask = np.load(valid_mask_path)
+        n_invalid = int((~valid_mask).sum())
+        if n_invalid > 0:
+            print(f"  Filtering {n_invalid} invalid embeddings (zero vectors)")
+            embeddings = embeddings[valid_mask]
+            metadata = metadata[valid_mask].reset_index(drop=True)
+    else:
+        print(f"  WARNING: Validity mask not found at {valid_mask_path} — skipping zero-vector filter")
+
     # Filter to labeled images only
     mask = metadata["has_fracture"].isin([0, 1])
     embeddings = embeddings[mask.values]
