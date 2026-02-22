@@ -8,7 +8,7 @@ Runs fully offline on Jetson Orin Nano ($249)
 
 Two HAI-DEF models:
   - CXR Foundation (google/cxr-foundation) — image embeddings + fracture classification
-  - MedGemma 1.5 4B (google/medgemma-1.5-4b-it) — clinical report generation
+  - MedGemma 1.5 4B (google/medgemma-1.5-4b-it) — clinical report generation + body region detection + visual safety audit
 """
 
 import argparse
@@ -37,14 +37,14 @@ from PIL import Image
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 MEDGEMMA_MODEL = os.environ.get("MEDGEMMA_MODEL", "hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M")
 
+SAFETY_AUDIT_ENABLED = os.environ.get("SAFETY_AUDIT_ENABLED", "true").lower() == "true"
+SAFETY_AUDIT_TIMEOUT = int(os.environ.get("SAFETY_AUDIT_TIMEOUT", "180"))
+
 TRIAGE_THRESHOLDS = {"red": 0.70, "yellow": 0.40}
-BODY_REGIONS = ["Hand", "Leg", "Hip", "Shoulder", "Unknown"]
+VALIDATED_REGIONS = {"Hand", "Leg", "Hip", "Shoulder"}
 
 LINEAR_PROBE_PATH = os.environ.get(
     "PROBE_PATH", "results/linear_probe/fracture_probe.joblib"
-)
-REGION_CLASSIFIER_PATH = os.environ.get(
-    "REGION_PATH", "results/linear_probe/region_classifier.joblib"
 )
 CXR_MODEL_PATH = os.environ.get(
     "CXR_MODEL_PATH", "models/cxr-foundation/elixr-c-v2-pooled"
@@ -133,10 +133,8 @@ class FractureClassifier:
         self.vision_model = None
         self.probe = None
         self.scaler = None
-        self.region_classifier = None
         self.model_loaded = False
         self.probe_loaded = False
-        self.region_loaded = False
         self._tf = None
         self._try_load()
 
@@ -222,19 +220,6 @@ class FractureClassifier:
                 pass  # Will be reported below
             except Exception as e:
                 print(f"Could not load linear probe: {e}")
-
-        # --- Load region classifier ---
-        if REGION_CLASSIFIER_PATH:
-            try:
-                data, actual_path = self._load_model_file(REGION_CLASSIFIER_PATH)
-                self.region_classifier = data
-                self.region_loaded = True
-                print(f"Region classifier loaded from {actual_path}")
-                print(f"  Classes: {list(self.region_classifier.classes_)}")
-            except FileNotFoundError:
-                pass  # Will be reported below
-            except Exception as e:
-                print(f"Could not load region classifier: {e}")
 
         # --- Load CXR Foundation vision model ---
         if CXR_MODEL_PATH and os.path.exists(CXR_MODEL_PATH):
@@ -375,28 +360,18 @@ class FractureClassifier:
         # Validate that input looks like an X-ray (advisory warnings only)
         image_warnings = self._validate_xray_image(image)
 
+        region_conf = None
+        region_auto = False
+
         if self.model_loaded and self.probe_loaded:
             prob, embedding = self._real_classify(image)
             model_used = "CXR Foundation + Linear Probe"
-
-            # Auto-detect body region from the same embedding
-            if body_region == "Unknown" and self.region_loaded:
-                detected_region, region_conf = self._detect_region(embedding)
-                body_region = detected_region
-                region_auto = True
-            else:
-                region_conf = None
-                region_auto = (body_region == "Unknown")
         elif self.probe_loaded and not self.model_loaded:
             prob = self._placeholder_score(body_region)
             model_used = "Placeholder (CXR Foundation not loaded)"
-            region_conf = None
-            region_auto = False
         else:
             prob = self._placeholder_score(body_region)
             model_used = "Placeholder (demo mode)"
-            region_conf = None
-            region_auto = False
 
         latency_ms = (time.time() - start) * 1000
         triage_level, triage_color = self._triage(prob)
@@ -411,24 +386,12 @@ class FractureClassifier:
             "latency_ms": round(latency_ms, 1),
             "region_auto_detected": region_auto,
         }
-        if region_conf is not None:
-            result["region_confidence"] = round(region_conf, 3)
 
         # Attach image validation warnings (FIX #8)
         if image_warnings:
             result["image_warnings"] = image_warnings
 
         return result
-
-    def _detect_region(self, embedding: np.ndarray) -> tuple[str, float]:
-        """Predict body region from CXR Foundation embedding."""
-        embedding_2d = embedding.reshape(1, -1)
-        region = self.region_classifier.predict(embedding_2d)[0]
-        proba = self.region_classifier.predict_proba(embedding_2d)[0]
-        conf = float(proba.max())
-        # Capitalize to match BODY_REGIONS list
-        region = region.capitalize()
-        return region, conf
 
     def _real_classify(self, image: Image.Image) -> tuple[float, np.ndarray]:
         """Full pipeline: image → CXR Foundation embedding → linear probe → probability.
@@ -547,7 +510,7 @@ has analyzed a {body_region} X-ray and produced the following results:
 - Fracture probability: {score_pct}% ({triage_level})
 - Classification: {classification}
 - Confidence: {confidence}
-{clinical_context_section}
+{clinical_context_section}{audit_findings_section}
 Provide a CLINICAL SUMMARY for the reviewing physician:
 
 1. Describe what this screening result suggests (2-3 sentences), including \
@@ -569,7 +532,7 @@ to a patient. The AI screening found:
 - Body part: {body_region}
 - Result: {classification} ({score_pct}% probability)
 - Urgency: {triage_level}
-{clinical_context_section}
+{clinical_context_section}{clinical_summary_section}
 Explain this result in 3-4 sentences using simple, reassuring language. \
 Avoid medical jargon. Let them know what happens next and that a doctor \
 will review everything. Do not be alarming — be honest but calming."""
@@ -584,7 +547,7 @@ has analyzed a {body_region} X-ray and produced the following results:
 - Fracture probability: {score_pct}% ({triage_level})
 - Classification: {classification}
 - Confidence: {confidence}
-{clinical_context_section}
+{clinical_context_section}{audit_findings_section}
 Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) using this exact schema:
 
 {{"primary_finding": "1-2 sentence clinical summary of what the screening suggests",\
@@ -600,12 +563,58 @@ to a patient. The AI screening found:
 - Body part: {body_region}
 - Result: {classification} ({score_pct}% probability)
 - Urgency: {triage_level}
-{clinical_context_section}
+{clinical_context_section}{clinical_summary_section}
 Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) using this exact schema:
 
 {{"summary": "2-3 sentence plain-language explanation of the result",\
  "next_steps": "What happens next, in simple terms",\
  "reassurance": "A brief reassuring statement about the process"}}"""
+
+SAFETY_AUDIT_PROMPT = """\
+You are a musculoskeletal radiology assistant performing a visual safety audit \
+of an X-ray image. A separate AI system (CXR Foundation) has already provided \
+a numeric fracture probability. Your job is to independently assess the image \
+for fracture indicators.
+
+Body region: {body_region}
+
+Analyze this X-ray image and look for:
+- Cortical breaks or discontinuities
+- Bone displacement or angulation
+- Soft tissue swelling adjacent to bone
+- Joint space irregularities
+- Periosteal reaction or callus formation
+
+Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) \
+using this exact schema:
+
+{{"visual_assessment": "fracture_likely | fracture_unlikely | uncertain",\
+ "observations": ["list of specific findings observed in the image"],\
+ "confidence_note": "brief note on image quality or limitations",\
+ "reasoning": "1-2 sentence explanation of your assessment"}}
+
+IMPORTANT:
+- Do NOT provide a numeric probability — that is CXR Foundation's job
+- Only report what you can actually observe in the image
+- If image quality is poor or findings are ambiguous, use "uncertain"
+- Focus on observable findings, not clinical assumptions"""
+
+REGION_DETECT_PROMPT = """\
+You are a medical imaging assistant. Look at this X-ray image and identify \
+the body region shown.
+
+Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) \
+using this exact schema:
+
+{{"region": "<body region name>"}}
+
+IMPORTANT:
+- Respond with a single, specific anatomical region name (e.g., Hand, Wrist, Elbow, \
+Forearm, Shoulder, Humerus, Spine, Ribs, Hip, Pelvis, Knee, Leg, Ankle, Foot)
+- Use standard clinical anatomical terms
+- Capitalize the first letter (e.g., "Elbow", not "elbow")
+- Choose the MOST SPECIFIC region you can identify
+- If you cannot determine the region, respond: {{"region": "Unknown"}}"""
 
 STRUCTURED_JSON_FIELDS_CLINICAL = [
     "primary_finding", "urgency", "recommendation", "differential", "clinical_note",
@@ -652,6 +661,80 @@ def _build_context_section(clinical_context: str) -> str:
         sanitized = _sanitize_clinical_context(clinical_context)
         if sanitized:
             return f"\nClinical context provided: {sanitized}\n"
+    return ""
+
+
+def _build_audit_findings_section(audit_result: dict | None) -> str:
+    """Format safety audit findings into a prompt section for clinical reports.
+
+    Returns empty string if audit was skipped, errored, or has no useful data.
+    """
+    if not audit_result or audit_result.get("skipped"):
+        return ""
+
+    visual = audit_result.get("visual_assessment", "")
+    concordance = audit_result.get("concordance", "")
+    reasoning = audit_result.get("reasoning", "")
+    observations = audit_result.get("observations", [])
+    confidence_note = audit_result.get("confidence_note", "")
+
+    # If there's nothing useful, return empty
+    if not visual and not observations:
+        return ""
+
+    lines = ["\nMedGemma Visual Safety Audit (advisory context — not directive):"]
+    if visual:
+        lines.append(f"- Visual assessment: {visual}")
+    if concordance and reasoning:
+        lines.append(f"- Cross-check result: {concordance} — {reasoning}")
+    if observations:
+        lines.append("- Observations:")
+        for obs in observations[:5]:
+            lines.append(f"  - {obs}")
+    if confidence_note:
+        lines.append(f"- Image quality note: {confidence_note}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _build_clinical_summary_section(clinical_report: dict | None) -> str:
+    """Format clinical report output into a prompt section for patient reports.
+
+    Uses structured JSON fields when available, falls back to truncated
+    narrative text. Returns empty string if clinical report errored.
+    """
+    if not clinical_report or clinical_report.get("error"):
+        return ""
+
+    parsed = clinical_report.get("structured_json")
+    if parsed:
+        lines = [
+            "\nClinical AI Summary (use as the basis for your explanation — "
+            "translate into patient-friendly language):"
+        ]
+        if parsed.get("primary_finding"):
+            lines.append(f"- Finding: {parsed['primary_finding']}")
+        if parsed.get("urgency"):
+            lines.append(f"- Urgency: {parsed['urgency']}")
+        if parsed.get("recommendation"):
+            lines.append(f"- Recommendation: {parsed['recommendation']}")
+        if parsed.get("differential"):
+            lines.append(f"- Differential: {parsed['differential']}")
+        lines.append("")
+        return "\n".join(lines)
+
+    # Fallback: use narrative text (truncated)
+    narrative = clinical_report.get("report_text", "").strip()
+    if narrative:
+        truncated = narrative[:500]
+        if len(narrative) > 500:
+            truncated += "..."
+        return (
+            f"\nClinical AI Summary (use as the basis for your explanation — "
+            f"translate into patient-friendly language):\n{truncated}\n"
+        )
+
     return ""
 
 
@@ -734,10 +817,91 @@ def _call_medgemma(prompt: str) -> dict:
     return resp.json()
 
 
+def _call_medgemma_vision(prompt: str, image: Image.Image) -> dict:
+    """Send a prompt + image to MedGemma via Ollama multimodal API.
+
+    Converts the PIL image to grayscale, resizes to max 1024px, and
+    encodes as base64 PNG for the Ollama /api/generate endpoint.
+    """
+    import base64
+
+    # Preprocess: grayscale, resize to max 1024px
+    img = image.convert("L")
+    max_dim = 1024
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+
+    # Encode to base64 PNG
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    b64_string = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    resp = requests.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={
+            "model": MEDGEMMA_MODEL,
+            "prompt": prompt,
+            "images": [b64_string],
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "num_predict": 512,
+                "top_p": 0.9,
+            },
+        },
+        timeout=SAFETY_AUDIT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _detect_region_medgemma(image: Image.Image) -> tuple[str, bool]:
+    """Detect body region from an X-ray image using MedGemma vision.
+
+    Returns (region_name, detected) where detected is True if MedGemma
+    successfully identified the region. Falls back to ("Unknown", False)
+    on any failure — never raises.
+    """
+    if not is_vision_available():
+        return ("Unknown", False)
+
+    try:
+        data = _call_medgemma_vision(REGION_DETECT_PROMPT, image)
+        raw = data.get("response", "").strip()
+
+        # Try JSON parse first — accepts ANY region name
+        parsed = _parse_json_response(raw)
+        if parsed and parsed.get("region"):
+            region = parsed["region"].strip().title()
+            if region and region != "Unknown":
+                return (region, True)
+
+        # Fallback: string match common anatomical terms in free-text
+        if raw:
+            raw_lower = raw.lower()
+            _COMMON_REGIONS = [
+                "Hand", "Wrist", "Forearm", "Elbow", "Humerus", "Shoulder",
+                "Clavicle", "Scapula", "Ribs", "Spine", "Pelvis", "Hip",
+                "Femur", "Knee", "Leg", "Tibia", "Fibula", "Ankle", "Foot",
+                "Skull", "Cervical", "Thoracic", "Lumbar", "Sacrum",
+            ]
+            for r in _COMMON_REGIONS:
+                if r.lower() in raw_lower:
+                    return (r, True)
+
+        return ("Unknown", False)
+    except Exception:
+        return ("Unknown", False)
+
+
 def generate_report(
     classification_result: dict,
     clinical_context: str = "",
     report_type: str = "clinical",
+    audit_result: dict | None = None,
+    clinical_summary: dict | None = None,
 ) -> dict:
     """Generate a structured + narrative report via MedGemma.
 
@@ -747,18 +911,35 @@ def generate_report(
       - structured_json: parsed dict or None
       - latency_s: total wall-clock seconds
       - error: error string or None
+
+    Optional chaining parameters:
+      - audit_result: safety audit dict, injected into clinical prompts
+      - clinical_summary: clinical report dict, injected into patient prompts
     """
     prob = classification_result["probability"]
     context_section = _build_context_section(clinical_context)
+    audit_section = _build_audit_findings_section(audit_result) if report_type == "clinical" else ""
+    clinical_section = _build_clinical_summary_section(clinical_summary) if report_type == "patient" else ""
 
-    fmt_kwargs = dict(
+    # Base kwargs for JSON prompt — keep clean so MedGemma 4B reliably
+    # follows the "respond with ONLY a valid JSON object" instruction.
+    base_kwargs = dict(
         body_region=classification_result["body_region"],
         score_pct=round(prob * 100, 1),
         triage_level=classification_result["triage_level"],
         classification="Fracture detected" if prob >= 0.5 else "No fracture detected",
         confidence=classification_result["confidence"],
         clinical_context_section=context_section,
+        audit_findings_section="",
+        clinical_summary_section="",
     )
+
+    # Enriched kwargs for narrative fallback — includes chained context
+    narrative_kwargs = {
+        **base_kwargs,
+        "audit_findings_section": audit_section,
+        "clinical_summary_section": clinical_section,
+    }
 
     json_template = CLINICAL_JSON_PROMPT if report_type == "clinical" else PATIENT_JSON_PROMPT
     narrative_template = CLINICAL_PROMPT if report_type == "clinical" else PATIENT_PROMPT
@@ -766,8 +947,8 @@ def generate_report(
 
     start = time.time()
     try:
-        # --- Attempt 1: structured JSON ---
-        json_prompt = json_template.format(**fmt_kwargs)
+        # --- Attempt 1: structured JSON (clean prompt) ---
+        json_prompt = json_template.format(**base_kwargs)
         data = _call_medgemma(json_prompt)
         raw_response = data.get("response", "").strip()
         parsed = _parse_json_response(raw_response)
@@ -776,8 +957,8 @@ def generate_report(
             # Structured output succeeded — render into narrative
             report_text = render_fn(parsed)
         else:
-            # JSON parse failed — fall back to narrative prompt
-            narrative_prompt = narrative_template.format(**fmt_kwargs)
+            # JSON parse failed — fall back to enriched narrative prompt
+            narrative_prompt = narrative_template.format(**narrative_kwargs)
             data = _call_medgemma(narrative_prompt)
             report_text = _clean_medgemma_output(data.get("response", "").strip())
 
@@ -837,6 +1018,182 @@ def _clean_medgemma_output(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Safety Audit — MedGemma Vision Cross-Validation
+# ---------------------------------------------------------------------------
+
+_vision_available = None
+_vision_lock = threading.Lock()
+
+
+def _check_vision_support() -> bool:
+    """Query Ollama to check if the configured MedGemma model is available."""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        if resp.ok:
+            models = [m["name"] for m in resp.json().get("models", [])]
+            return any(MEDGEMMA_MODEL in m or m in MEDGEMMA_MODEL for m in models)
+        return False
+    except Exception:
+        return False
+
+
+def is_vision_available() -> bool:
+    """Cached, thread-safe check for MedGemma vision model availability."""
+    global _vision_available
+    if _vision_available is None:
+        with _vision_lock:
+            if _vision_available is None:
+                _vision_available = _check_vision_support()
+    return _vision_available
+
+
+def _compute_concordance(cxr_probability: float, visual_assessment: str) -> dict:
+    """Compare CXR Foundation probability with MedGemma visual assessment.
+
+    Returns a dict with concordance status and reasoning.
+    """
+    # Map CXR probability to simplified category
+    if cxr_probability >= TRIAGE_THRESHOLDS["red"]:  # >= 0.70
+        cxr_category = "fracture_likely"
+    elif cxr_probability < TRIAGE_THRESHOLDS["yellow"]:  # < 0.40
+        cxr_category = "fracture_unlikely"
+    else:
+        cxr_category = "uncertain"
+
+    # Normalize visual assessment
+    va = visual_assessment.lower().strip() if visual_assessment else ""
+    if va not in ("fracture_likely", "fracture_unlikely", "uncertain"):
+        return {
+            "concordance": "UNCERTAIN",
+            "cxr_category": cxr_category,
+            "visual_assessment": visual_assessment,
+            "reasoning": (
+                f"MedGemma returned unexpected assessment '{visual_assessment}'"
+                " — defaulting to UNCERTAIN."
+            ),
+        }
+
+    # Concordance matrix
+    if cxr_category == va:
+        concordance = "CONCORDANT"
+        reasoning = (
+            f"Both models agree: CXR Foundation ({cxr_category}) and "
+            f"MedGemma Vision ({va}) reached the same conclusion."
+        )
+    elif cxr_category == "uncertain" or va == "uncertain":
+        concordance = "UNCERTAIN"
+        reasoning = (
+            f"One or both models are uncertain: CXR Foundation ({cxr_category}), "
+            f"MedGemma Vision ({va})."
+        )
+    else:
+        concordance = "DISCORDANT"
+        reasoning = (
+            f"Models DISAGREE: CXR Foundation says {cxr_category} but "
+            f"MedGemma Vision says {va}. Manual review recommended."
+        )
+
+    return {
+        "concordance": concordance,
+        "cxr_category": cxr_category,
+        "visual_assessment": va,
+        "reasoning": reasoning,
+    }
+
+
+def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
+    """Run MedGemma vision analysis and compare with CXR Foundation result.
+
+    Returns a dict with concordance, observations, and metadata.
+    Always returns a valid dict — never raises.
+    """
+    if not SAFETY_AUDIT_ENABLED:
+        return {
+            "skipped": True,
+            "reason": "Safety audit disabled via SAFETY_AUDIT_ENABLED=false",
+        }
+
+    if not is_vision_available():
+        return {
+            "skipped": True,
+            "reason": (
+                f"MedGemma model not available. "
+                f"Pull it with: ollama pull {MEDGEMMA_MODEL}"
+            ),
+        }
+
+    start = time.time()
+    try:
+        prompt = SAFETY_AUDIT_PROMPT.format(
+            body_region=classification_result.get("body_region", "Unknown"),
+        )
+        data = _call_medgemma_vision(prompt, image)
+        raw_response = data.get("response", "").strip()
+
+        parsed = _parse_json_response(raw_response)
+        if parsed is None:
+            visual_assessment = "uncertain"
+            observations = []
+            confidence_note = "MedGemma returned non-JSON response"
+            reasoning = raw_response[:200] if raw_response else "No response"
+        else:
+            visual_assessment = parsed.get("visual_assessment", "uncertain")
+            observations = parsed.get("observations", [])
+            if not isinstance(observations, list):
+                observations = []
+            confidence_note = parsed.get("confidence_note", "")
+            reasoning = parsed.get("reasoning", "")
+
+        concordance_result = _compute_concordance(
+            classification_result["probability"],
+            visual_assessment,
+        )
+
+        latency = round(time.time() - start, 1)
+        return {
+            "skipped": False,
+            "concordance": concordance_result["concordance"],
+            "cxr_category": concordance_result["cxr_category"],
+            "visual_assessment": visual_assessment,
+            "observations": observations,
+            "confidence_note": confidence_note,
+            "reasoning": concordance_result["reasoning"],
+            "vision_reasoning": reasoning,
+            "latency_s": latency,
+            "error": None,
+        }
+    except requests.ConnectionError:
+        return {
+            "skipped": False,
+            "concordance": "UNCERTAIN",
+            "observations": [],
+            "reasoning": "Cannot connect to Ollama for vision analysis.",
+            "latency_s": round(time.time() - start, 1),
+            "error": "Connection refused — is Ollama running?",
+        }
+    except requests.Timeout:
+        return {
+            "skipped": False,
+            "concordance": "UNCERTAIN",
+            "observations": [],
+            "reasoning": (
+                f"MedGemma vision timed out (>{SAFETY_AUDIT_TIMEOUT}s)."
+            ),
+            "latency_s": round(time.time() - start, 1),
+            "error": f"Vision analysis timed out (>{SAFETY_AUDIT_TIMEOUT}s)",
+        }
+    except Exception as e:
+        return {
+            "skipped": False,
+            "concordance": "UNCERTAIN",
+            "observations": [],
+            "reasoning": f"Safety audit error: {str(e)}",
+            "latency_s": round(time.time() - start, 1),
+            "error": str(e),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Evidence / Transparency helpers
 # ---------------------------------------------------------------------------
 
@@ -850,11 +1207,17 @@ def get_model_transparency_info(result: dict) -> str:
         "Leg": "tibial shaft fractures, fibula fractures, ankle fractures, and stress fractures",
         "Hip": "femoral neck fractures, intertrochanteric fractures, and acetabular fractures",
         "Shoulder": "proximal humerus fractures, clavicle fractures, and scapular fractures",
-        "Unknown": "various fracture patterns depending on the anatomical region",
     }
 
     lines = []
     lines.append("### How This Result Was Produced\n")
+    lines.append(
+        "**Step 0 — Region Detection:** "
+        "[MedGemma 1.5 4B](https://huggingface.co/google/medgemma-1.5-4b-it) "
+        "analyzed the X-ray image to automatically identify the body region "
+        f"(**{region}**). This uses MedGemma's vision capability to classify "
+        "the anatomical area before fracture screening begins.\n"
+    )
     lines.append(
         "**Step 1 — Image Analysis:** Your X-ray was processed by "
         "[CXR Foundation](https://huggingface.co/google/cxr-foundation), "
@@ -873,22 +1236,23 @@ def get_model_transparency_info(result: dict) -> str:
         "**Step 3 — Clinical Report:** "
         "[MedGemma 1.5 4B](https://huggingface.co/google/medgemma-1.5-4b-it), "
         "a medical language model, interpreted the screening score and generated "
-        "a clinical summary. MedGemma **does not see the X-ray image** — it only "
-        "receives the numeric score and body region to prevent hallucinated visual findings.\n"
+        "a clinical summary. MedGemma also performs a visual safety audit, "
+        "independently assessing the X-ray image to cross-check the CXR Foundation result.\n"
     )
     lines.append("### What This Means\n")
 
     if prob >= 0.70:
         lines.append(
             f"A score of **{round(prob * 100, 1)}%** indicates high suspicion of fracture. "
-            f"Common fractures in the {region.lower()} include {region_context.get(region, '')}. "
+            f"Common fractures in the {region.lower()} include "
+            f"{region_context.get(region, f'various fracture patterns typical of the {region.lower()}')}. "
             "**This case should be prioritized for radiologist review.**"
         )
     elif prob >= 0.40:
         lines.append(
             f"A score of **{round(prob * 100, 1)}%** falls in the uncertain range. "
             f"The model detected features that partially match fracture patterns in the {region.lower()} "
-            f"(common types: {region_context.get(region, '')}). "
+            f"(common types: {region_context.get(region, f'various fracture patterns typical of the {region.lower()}')}). "
             "Additional imaging or clinical correlation is recommended."
         )
     else:
@@ -907,6 +1271,13 @@ def get_model_transparency_info(result: dict) -> str:
         "- Performance varies by body region and fracture type\n"
         "- Always requires review by a qualified healthcare professional"
     )
+
+    if region not in VALIDATED_REGIONS:
+        lines.append(
+            f"\n- **Unvalidated region:** The linear probe was trained on Hand, Leg, Hip, "
+            f"and Shoulder X-rays only (FracAtlas). Performance on **{region}** X-rays "
+            f"has not been formally validated — interpret with additional caution"
+        )
 
     return "\n".join(lines)
 
@@ -957,6 +1328,13 @@ def get_performance_context() -> str:
         "representations for musculoskeletal fracture detection.*"
     )
 
+    lines.append(
+        "\n*Performance data covers the 4 body regions in the FracAtlas dataset. "
+        "For X-rays from other body regions, the model has not been formally evaluated. "
+        "The CXR Foundation embeddings may still transfer effectively, but AUC estimates "
+        "are unavailable.*"
+    )
+
     lines.append("\n### Edge Deployment\n")
     lines.append("| Metric | Target | Status |")
     lines.append("|--------|--------|--------|")
@@ -974,7 +1352,7 @@ def get_performance_context() -> str:
 # Batch Triage
 # ---------------------------------------------------------------------------
 
-def run_batch_triage(files, body_region):
+def run_batch_triage(files):
     """Process multiple X-rays and return a prioritized triage summary table."""
     if not files:
         return "Upload one or more X-ray images to run batch triage."
@@ -985,11 +1363,13 @@ def run_batch_triage(files, body_region):
         filename = Path(filepath).name
         try:
             img = Image.open(filepath)
+            body_region, _detected = _detect_region_medgemma(img)
             result = get_classifier().classify(img, body_region)
+            result["region_auto_detected"] = _detected
 
             # FIX #15: audit-log each batch prediction
             prediction_logger.log_prediction(
-                result, body_region_input=body_region,
+                result, body_region_input="auto",
             )
 
             color_emoji = {"red": "🔴", "yellow": "🟡", "green": "🟢"}[
@@ -1009,7 +1389,7 @@ def run_batch_triage(files, body_region):
                 "File": filename,
                 "Fracture %": "Error",
                 "Triage": str(e)[:50],
-                "Region": body_region,
+                "Region": "Unknown",
                 "Latency": "-",
             })
 
@@ -1067,8 +1447,15 @@ def check_ollama_status():
             models = [m["name"] for m in resp.json().get("models", [])]
             has_medgemma = any("medgemma" in m.lower() for m in models)
             if has_medgemma:
-                return "✅ Ollama running · MedGemma available"
-            return f"⚠️ Ollama running · MedGemma not found. Models: {', '.join(models) or 'none'}"
+                status = "✅ Ollama running · MedGemma available"
+            else:
+                status = f"⚠️ Ollama running · MedGemma not found. Models: {', '.join(models) or 'none'}"
+            # Safety audit status
+            if SAFETY_AUDIT_ENABLED:
+                status += f" · Safety audit: {'ready' if has_medgemma else 'model not found'}"
+            else:
+                status += " · Safety audit: disabled"
+            return status
         return "⚠️ Ollama error"
     except requests.ConnectionError:
         return "❌ Ollama not running — start with: ollama serve"
@@ -1076,11 +1463,12 @@ def check_ollama_status():
         return f"❌ {e}"
 
 
-def step_triage(image, body_region, clinical_context):
+def step_triage(image, clinical_context):
     """Step 1 → Step 2 + Step 3: Run triage and auto-generate both reports."""
     if image is None:
         return (
             gr.update(visible=False), "", "",
+            gr.update(visible=False), "",
             gr.update(visible=False), None,
             "", "", "", "",
         )
@@ -1088,12 +1476,14 @@ def step_triage(image, body_region, clinical_context):
     pil_image = (
         Image.fromarray(image) if not isinstance(image, Image.Image) else image
     )
+    body_region, region_detected = _detect_region_medgemma(pil_image)
     result = get_classifier().classify(pil_image, body_region)
+    result["region_auto_detected"] = region_detected
 
     # FIX #15: audit-log every triage prediction
     prediction_logger.log_prediction(
         result,
-        body_region_input=body_region,
+        body_region_input="auto",
         clinical_context=clinical_context or "",
     )
 
@@ -1105,17 +1495,32 @@ def step_triage(image, body_region, clinical_context):
     triage_html = _make_triage_card(result)
     reasoning = _make_reasoning_text(result)
 
-    # Auto-generate both reports
-    clinical = generate_report(result, clinical_context or "", report_type="clinical")
+    # Safety audit: MedGemma vision cross-validation
+    # Runs after CXR classification, before report generation (sequential
+    # to avoid Ollama GPU memory contention on Jetson)
+    audit_result = run_safety_audit(pil_image, result)
+    audit_html = _make_safety_audit_card(audit_result)
+    state["audit_result"] = audit_result
+
+    # Auto-generate both reports (chained: audit → clinical → patient)
+    clinical = generate_report(
+        result, clinical_context or "", report_type="clinical",
+        audit_result=audit_result,
+    )
     clinical_narrative, clinical_json = _format_report_output(clinical)
 
-    patient = generate_report(result, clinical_context or "", report_type="patient")
+    patient = generate_report(
+        result, clinical_context or "", report_type="patient",
+        clinical_summary=clinical,
+    )
     patient_narrative, patient_json = _format_report_output(patient)
 
     return (
         gr.update(visible=True),
         triage_html,
         reasoning,
+        gr.update(visible=True),
+        audit_html,
         gr.update(visible=True),
         state,
         clinical_narrative,
@@ -1224,10 +1629,9 @@ def _make_reasoning_text(result: dict) -> str:
         f"{'Fracture detected' if prob >= 0.5 else 'No fracture detected'}"
     )
     lines.append(f"**Confidence:** {result['confidence']}")
-    if result.get("region_auto_detected") and result.get("region_confidence"):
+    if result.get("region_auto_detected"):
         lines.append(
-            f"**Body region:** {region} "
-            f"*(auto-detected, {round(result['region_confidence'] * 100, 1)}% confidence)*"
+            f"**Body region:** {region} *(auto-detected by MedGemma)*"
         )
     else:
         lines.append(f"**Body region:** {region}")
@@ -1255,6 +1659,93 @@ def _make_reasoning_text(result: dict) -> str:
         )
 
     return "\n\n".join(lines)
+
+
+def _make_safety_audit_card(audit_result: dict) -> str:
+    """Build HTML card for the safety audit cross-check result."""
+    if audit_result.get("skipped"):
+        reason = audit_result.get("reason", "Safety audit skipped")
+        return f"""
+        <div style="padding:16px; border-radius:12px; background:#374151; color:#9ca3af;
+                    font-family:system-ui; margin:8px 0; border:1px solid #4b5563;">
+            <div style="font-size:14px; font-weight:600; margin-bottom:4px;">
+                ⏭️ Safety Audit Skipped
+            </div>
+            <div style="font-size:13px;">{reason}</div>
+        </div>
+        """
+
+    concordance = audit_result.get("concordance", "UNCERTAIN")
+
+    style_map = {
+        "CONCORDANT": ("#065f46", "#d1fae5", "#047857", "✅", "Both models agree"),
+        "DISCORDANT": (
+            "#991b1b", "#fef2f2", "#dc2626", "⚠️",
+            "Models DISAGREE — review needed",
+        ),
+        "UNCERTAIN": (
+            "#92400e", "#fffbeb", "#d97706", "❓",
+            "Cross-check inconclusive",
+        ),
+    }
+    text_color, bg_color, border_color, icon, headline = style_map.get(
+        concordance, style_map["UNCERTAIN"]
+    )
+
+    # Build observations list (cap at 5)
+    observations = audit_result.get("observations", [])[:5]
+    obs_html = ""
+    if observations:
+        obs_items = "".join(f"<li>{obs}</li>" for obs in observations)
+        obs_html = (
+            '<div style="margin-top:8px;">'
+            '<div style="font-size:12px; font-weight:600; margin-bottom:4px;">'
+            "Visual Observations:</div>"
+            f'<ul style="margin:0; padding-left:20px; font-size:12px;">'
+            f"{obs_items}</ul></div>"
+        )
+
+    reasoning = audit_result.get("reasoning", "")
+    reasoning_html = ""
+    if reasoning:
+        reasoning_html = (
+            f'<div style="margin-top:8px; font-size:12px; '
+            f'font-style:italic; opacity:0.85;">{reasoning}</div>'
+        )
+
+    error = audit_result.get("error")
+    error_html = ""
+    if error:
+        error_html = (
+            f'<div style="margin-top:6px; font-size:11px; '
+            f'color:#dc2626;">Error: {error}</div>'
+        )
+
+    latency = audit_result.get("latency_s", "")
+    latency_html = f" · {latency}s" if latency else ""
+
+    border_style = (
+        f"3px solid {border_color}" if concordance == "DISCORDANT"
+        else f"1px solid {border_color}"
+    )
+
+    return f"""
+    <div style="padding:16px; border-radius:12px; background:{bg_color}; color:{text_color};
+                font-family:system-ui; margin:8px 0; border:{border_style};">
+        <div style="font-size:16px; font-weight:700; margin-bottom:4px;">
+            {icon} {headline}
+        </div>
+        <div style="font-size:13px; opacity:0.8;">
+            MedGemma Visual Safety Audit{latency_html}
+        </div>
+        {obs_html}
+        {reasoning_html}
+        {error_html}
+        <div style="margin-top:10px; font-size:11px; opacity:0.6;">
+            This is an AI cross-check, not a diagnosis. Always defer to clinical judgment.
+        </div>
+    </div>
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -1300,11 +1791,6 @@ def build_ui():
                             label="X-ray Image", type="pil", height=350,
                         )
                     with gr.Column(scale=1):
-                        body_region = gr.Dropdown(
-                            choices=BODY_REGIONS, value="Unknown",
-                            label="Body Region",
-                            info="Leave as 'Unknown' to auto-detect, or select manually to override",
-                        )
                         clinical_context = gr.Textbox(
                             label="Clinical Context (optional)",
                             placeholder=(
@@ -1327,6 +1813,15 @@ def build_ui():
                             triage_card = gr.HTML()
                         with gr.Column(scale=1):
                             reasoning_text = gr.Markdown()
+
+                # ── CROSS-CHECK: MedGemma Visual Safety Audit ──
+                audit_container = gr.Column(visible=False)
+                with audit_container:
+                    gr.Markdown("---")
+                    gr.Markdown(
+                        "#### Cross-Check — MedGemma Visual Safety Audit"
+                    )
+                    audit_card = gr.HTML()
 
                 # ── STEP 3: Clinical Reports ──
                 step3_container = gr.Column(visible=False)
@@ -1401,16 +1896,11 @@ def build_ui():
                     surface to the top.
                     """
                 )
-                with gr.Row():
-                    batch_files = gr.File(
-                        label="Upload X-ray Images",
-                        file_count="multiple",
-                        file_types=["image"],
-                    )
-                    batch_region = gr.Dropdown(
-                        choices=BODY_REGIONS, value="Unknown",
-                        label="Body Region (applied to all)",
-                    )
+                batch_files = gr.File(
+                    label="Upload X-ray Images",
+                    file_count="multiple",
+                    file_types=["image"],
+                )
                 batch_btn = gr.Button(
                     "🔍 Run Batch Triage", variant="primary", size="lg",
                 )
@@ -1446,7 +1936,8 @@ def build_ui():
                             fracture detection across 4 body regions — with as few as
                             500 labeled examples reaching 0.82 AUC.
                             [MedGemma 1.5 4B](https://huggingface.co/google/medgemma-1.5-4b-it)
-                            provides clinical reasoning and patient communication.
+                            adds automatic body-region detection, visual safety
+                            cross-checking, and clinician/patient communication.
 
                             **Key Result:** Overall AUC **0.882** across hand, leg,
                             hip, and shoulder — from a model that has never seen a
@@ -1456,7 +1947,7 @@ def build_ui():
 
                             **HAI-DEF Models Used:**
                             - **CXR Foundation** — Image embeddings & fracture classification
-                            - **MedGemma 1.5 4B** — Clinical report generation
+                            - **MedGemma 1.5 4B** — Region detection, visual safety audit, and report generation
 
                             **Dataset:**
                             [FracAtlas](https://figshare.com/articles/dataset/The_dataset/22363012)
@@ -1484,7 +1975,8 @@ def build_ui():
                             - **MedGemma:** `{MEDGEMMA_MODEL}`
                             - **CXR Foundation:** `{'Loaded ✓' if get_classifier().model_loaded else 'Not loaded — placeholder mode'}`
                             - **Linear probe:** `{'Loaded ✓ (0.882 AUC)' if get_classifier().probe_loaded else 'Not loaded — placeholder mode'}`
-                            - **Region classifier:** `{'Loaded ✓ — auto-detects body region' if get_classifier().region_loaded else 'Not loaded — manual selection'}`
+                            - **Region detection:** `MedGemma vision (auto)`
+                            - **Safety Audit:** `{'Enabled ✓ — MedGemma vision cross-check' if SAFETY_AUDIT_ENABLED else 'Disabled'}`
                             """
                         )
 
@@ -1492,9 +1984,10 @@ def build_ui():
 
         triage_btn.click(
             fn=step_triage,
-            inputs=[image_input, body_region, clinical_context],
+            inputs=[image_input, clinical_context],
             outputs=[
                 step2_container, triage_card, reasoning_text,
+                audit_container, audit_card,
                 step3_container, triage_state,
                 clinical_report_md, clinical_json_md,
                 patient_report_md, patient_json_md,
@@ -1509,7 +2002,7 @@ def build_ui():
 
         batch_btn.click(
             fn=run_batch_triage,
-            inputs=[batch_files, batch_region],
+            inputs=[batch_files],
             outputs=[batch_results],
         )
 
@@ -1540,10 +2033,9 @@ if __name__ == "__main__":
     print(f"  MedGemma:     {MEDGEMMA_MODEL}")
     print(f"  CXR Model:    {CXR_MODEL_PATH or 'Not configured'}")
     print(f"  Linear Probe: {LINEAR_PROBE_PATH or 'Not configured'}")
-    print(f"  Region Model: {REGION_CLASSIFIER_PATH or 'Not configured'}")
     print(f"  CXR loaded:   {'✓' if get_classifier().model_loaded else '✗ (placeholder mode)'}")
     print(f"  Probe loaded: {'✓' if get_classifier().probe_loaded else '✗ (placeholder mode)'}")
-    print(f"  Region loaded:{'✓ (auto-detect)' if get_classifier().region_loaded else '✗ (manual select)'}")
+    print(f"  Region:       MedGemma vision (auto-detect)")
     print("=" * 60)
 
     app = build_ui()

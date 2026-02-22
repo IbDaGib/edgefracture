@@ -19,7 +19,7 @@ iterate quickly. The Jetson is for the final demo and edge benchmarks only.
 2. Download CXR Foundation model
 3. Extract all embeddings → `embeddings.npy`
 4. Run zero-shot experiment → results + plots
-5. Train linear probe + data efficiency curve → `fracture_probe.pkl` + plots
+5. Train linear probe + data efficiency curve → `fracture_probe.joblib` + plots
 6. Test MedGemma via Ollama (Mac runs it great)
 7. Test Gradio app locally to make sure it works
 
@@ -27,7 +27,7 @@ iterate quickly. The Jetson is for the final demo and edge benchmarks only.
 ```
 embeddings.npy          (~50-150 MB)  — only if you want to re-run experiments
 metadata.csv            (~200 KB)
-fracture_probe.pkl      (~1 KB)       — the trained linear probe
+fracture_probe.joblib   (~1 KB)       — the trained linear probe
 data_efficiency_curve.png              — for the writeup
 combined_summary.png                   — for the writeup
 per_region_auc.png                     — for the writeup
@@ -142,7 +142,7 @@ mkdir -p transfer_to_jetson/results/embeddings
 mkdir -p transfer_to_jetson/results/zero_shot
 
 # Copy what the Jetson needs
-cp results/linear_probe/fracture_probe.pkl transfer_to_jetson/results/linear_probe/
+cp results/linear_probe/fracture_probe.joblib transfer_to_jetson/results/linear_probe/
 cp results/linear_probe/*.png transfer_to_jetson/results/linear_probe/
 cp results/linear_probe/*.json transfer_to_jetson/results/linear_probe/
 cp results/embeddings/embeddings.npy transfer_to_jetson/results/embeddings/

@@ -18,6 +18,12 @@ These proposals already exist in `app/app.py` and can be skipped entirely:
 ### ~~10. Patient context field in Gradio~~
 **Status: DONE** — Clinical context textbox exists in the Triage tab (512 char max). Input is sanitized by `_sanitize_clinical_context()` which strips 12 injection patterns, caps length, and removes prompt-breaking characters. Context is fed to MedGemma prompts alongside the fracture score. No work needed.
 
+### ~~6. Structured JSON output from MedGemma~~
+**Status: DONE** — `generate_report()` now attempts JSON-first prompts (`CLINICAL_JSON_PROMPT`, `PATIENT_JSON_PROMPT`), parses model output, and renders both narrative markdown and machine-readable JSON in the UI. Falls back to narrative output when JSON parsing fails.
+
+### ~~8. MedGemma visual safety auditor~~
+**Status: DONE** — `run_safety_audit()` performs a MedGemma vision pass after CXR classification, computes concordance (`CONCORDANT` / `DISCORDANT` / `UNCERTAIN`), and surfaces findings in a dedicated cross-check card.
+
 ---
 
 ## REMAINING ITEMS — Ranked Most to Least Important
@@ -73,22 +79,11 @@ Reformat `data_efficiency_curve.png` to match Google's axes: AUC (y) vs. trainin
 ### #5. Conditional MedGemma invocation (auto-skip for Green)
 **Original rank: 3 | Effort: ~15 min | Impact: MEDIUM**
 
-Currently, MedGemma report generation is manually triggered via "Generate Clinician Report" / "Generate Patient Explanation" buttons. The proposal is to auto-skip report generation for GREEN triage (< 0.40 probability) and only show the instant score card.
+Current behavior: `step_triage()` auto-generates both clinician and patient reports after triage for all score bands. This proposal is to skip report generation for GREEN triage (< 0.40 probability) to cut end-to-end latency.
 
-**Why #5 (downgraded from original #3):** The current UI already separates triage (instant) from reports (on-demand). Users don't wait for MedGemma unless they click the button. The latency savings are real but less dramatic than the proposal assumes since it's already a two-step flow. Still worth doing for demo polish — hide or disable report buttons for Green cases with a message like "Low suspicion — no detailed report needed."
+**Why #5:** Auto-generation improves UX but adds avoidable latency for low-suspicion cases. Skipping MedGemma on green cases would preserve fast triage while reducing GPU contention and response time.
 
-**How it works here:** In `app/app.py`, modify the report generation button visibility/interactivity based on the triage result. Use Gradio's `gr.update(interactive=False, visible=False)` pattern in the classify callback.
-
----
-
-### #6. Structured JSON output from MedGemma
-**Original rank: 8 | Effort: ~1 hour | Impact: MEDIUM**
-
-Force MedGemma output into a structured format: `{"primary_finding": ..., "confidence": ..., "recommendation": ..., "visual_evidence": ...}`.
-
-**Why #6:** Makes the output machine-readable and integration-ready. However, the metadata block is already appended programmatically (see "ALREADY DONE" above), so the structured data judges care about is already present. This adds value primarily for downstream system integration (hospital dashboards), which is a demo talking point but not a functional requirement.
-
-**How it works here:** Modify the MedGemma prompt templates in `app/app.py` (~line 280-330) to request JSON output. Add a `json.loads()` parsing step with fallback to free-text if parsing fails. Render the structured fields in the Gradio UI alongside the narrative report.
+**How it works here:** In `app/app.py`, branch inside `step_triage()` before the `generate_report()` calls. For green cases, return a concise low-risk message and bypass MedGemma report generation.
 
 ---
 
@@ -113,25 +108,12 @@ def _preprocess_dicom(self, dicom_path: str) -> Image.Image:
 
 ---
 
-### #8. MedGemma as "Safety Auditor" (two-agent handoff)
-**Original rank: 11 | Effort: ~2-3 hours | Impact: LOW-MEDIUM**
-
-CXR Foundation flags probability, then MedGemma reasons about anatomical consistency (e.g., "high fracture probability but patient is 5 years old — could be a growth plate").
-
-**Why #8:** Conceptually appealing but risky. The current architecture is clean: CXR Foundation handles vision, MedGemma generates reports from text scores. MedGemma never sees the image. Adding a verification step where MedGemma "audits" the score without seeing the image is performative, not functional. Only worthwhile if MedGemma receives the patient context field and can flag anatomically implausible scenarios (e.g., "shoulder fracture but image appears to be a hand").
-
-**Caution:** The proposal itself warns against "agentic" framing. If this is just rubber-stamping, it hurts credibility. Only implement if there's a genuine verification pathway.
-
-**How it works here:** Would require a second MedGemma call with a different prompt template focused on consistency checking. Add to `app/app.py` after the classification step but before report generation. Return a "consistency flag" in the result dict.
-
----
-
 ### #9. 8-bit quantization instead of 4-bit
 **Original rank: 12 | Effort: ~1-2 hours | Impact: LOW**
 
 Currently using Q4_K_M quantization for MedGemma via Ollama (~2.5GB). Upgrading to 8-bit would improve text quality.
 
-**Why #9 (lowest priority):** As the proposal correctly notes, MedGemma only receives text scores — it never sees the X-ray image. The "preserving cortical step-off detail" argument is irrelevant to the current architecture. 8-bit would only matter if MedGemma processed images directly. Additionally, both CXR Foundation (~1GB) and MedGemma need to fit in 8GB Jetson RAM. An 8-bit model (~4-5GB) may not leave enough room.
+**Why #9 (lowest priority):** MedGemma now does vision tasks (region detection + visual safety audit), so higher precision could improve robustness. But the memory tradeoff is still severe on 8GB Jetson: CXR Foundation + MedGemma 8-bit + OS overhead leaves little headroom and may increase OOM risk.
 
 **How it works here:** Change the Ollama model quantization. Test memory usage on Jetson: `CXR Foundation (~1GB) + MedGemma 8-bit (~4.5GB) + OS overhead (~1.5GB) = ~7GB`. Tight but possibly feasible. Would need actual Jetson testing to confirm.
 
@@ -144,17 +126,17 @@ Currently using Q4_K_M quantization for MedGemma via Ollama (~2.5GB). Upgrading 
 | -- | Safety disclaimers | -- | ALREADY DONE | -- |
 | -- | Metadata appending | -- | ALREADY DONE | -- |
 | -- | Patient context field | -- | ALREADY DONE | -- |
+| -- | Structured JSON output | -- | ALREADY DONE | -- |
+| -- | MedGemma safety auditor | -- | ALREADY DONE | -- |
 | 1 | Publish probe on HuggingFace | 15 min | TODO | HIGH |
 | 2 | Human story opening | 5 min | TODO | HIGH |
 | 3 | Cite 45-image TB result | 5 min | TODO | HIGH |
 | 4 | Mirror Google's chart format | 20 min | TODO | MEDIUM-HIGH |
 | 5 | Conditional MedGemma (Green skip) | 15 min | TODO | MEDIUM |
-| 6 | Structured JSON from MedGemma | 1 hr | TODO | MEDIUM |
 | 7 | DICOM preprocessor | 1-2 hr | TODO | MEDIUM |
-| 8 | MedGemma safety auditor | 2-3 hr | TODO | LOW-MEDIUM |
 | 9 | 8-bit quantization | 1-2 hr | TODO | LOW |
 
-**Total remaining work:** Items 1-5 are ~60 minutes and cover the highest-impact improvements. Items 6-7 add professional polish. Items 8-9 are only worth attempting if everything else is done and tested.
+**Total remaining work:** Items 1-5 are ~60 minutes and cover the highest-impact improvements. Items 7 and 9 add extra polish only after the core deliverables are done.
 
 ## What NOT to Do (Confirmed)
 

@@ -19,11 +19,20 @@ from app.app import (
     SAFETY_DISCLAIMER,
     _sanitize_clinical_context,
     _build_context_section,
+    _build_audit_findings_section,
+    _build_clinical_summary_section,
     _parse_json_response,
     _render_structured_clinical,
     _render_structured_patient,
     _format_report_output,
+    _compute_concordance,
+    _make_safety_audit_card,
+    run_safety_audit,
+    generate_report,
+    _detect_region_medgemma,
     TRIAGE_THRESHOLDS,
+    SAFETY_AUDIT_ENABLED,
+    VALIDATED_REGIONS,
 )
 
 
@@ -593,3 +602,665 @@ class TestFormatReportOutput:
         narrative, raw_json = _format_report_output(report)
         assert "Fallback narrative." in narrative
         assert "unavailable" in raw_json.lower()
+
+
+# ---------------------------------------------------------------------------
+# 11. Concordance logic
+# ---------------------------------------------------------------------------
+
+class TestComputeConcordance:
+    """All 9 cells of the concordance matrix + boundary + invalid cases."""
+
+    # ---- CONCORDANT cells ----
+
+    def test_both_likely(self):
+        r = _compute_concordance(0.80, "fracture_likely")
+        assert r["concordance"] == "CONCORDANT"
+        assert r["cxr_category"] == "fracture_likely"
+        assert r["visual_assessment"] == "fracture_likely"
+
+    def test_both_unlikely(self):
+        r = _compute_concordance(0.20, "fracture_unlikely")
+        assert r["concordance"] == "CONCORDANT"
+
+    def test_both_uncertain(self):
+        r = _compute_concordance(0.55, "uncertain")
+        assert r["concordance"] == "CONCORDANT"
+
+    # ---- DISCORDANT cells ----
+
+    def test_cxr_likely_medgemma_unlikely(self):
+        r = _compute_concordance(0.85, "fracture_unlikely")
+        assert r["concordance"] == "DISCORDANT"
+
+    def test_cxr_unlikely_medgemma_likely(self):
+        r = _compute_concordance(0.15, "fracture_likely")
+        assert r["concordance"] == "DISCORDANT"
+
+    # ---- UNCERTAIN cells ----
+
+    def test_cxr_likely_medgemma_uncertain(self):
+        r = _compute_concordance(0.80, "uncertain")
+        assert r["concordance"] == "UNCERTAIN"
+
+    def test_cxr_unlikely_medgemma_uncertain(self):
+        r = _compute_concordance(0.20, "uncertain")
+        assert r["concordance"] == "UNCERTAIN"
+
+    def test_cxr_uncertain_medgemma_likely(self):
+        r = _compute_concordance(0.55, "fracture_likely")
+        assert r["concordance"] == "UNCERTAIN"
+
+    def test_cxr_uncertain_medgemma_unlikely(self):
+        r = _compute_concordance(0.55, "fracture_unlikely")
+        assert r["concordance"] == "UNCERTAIN"
+
+    # ---- Boundary values ----
+
+    def test_boundary_070_is_likely(self):
+        r = _compute_concordance(0.70, "fracture_likely")
+        assert r["concordance"] == "CONCORDANT"
+        assert r["cxr_category"] == "fracture_likely"
+
+    def test_boundary_039_is_unlikely(self):
+        r = _compute_concordance(0.39, "fracture_unlikely")
+        assert r["concordance"] == "CONCORDANT"
+        assert r["cxr_category"] == "fracture_unlikely"
+
+    def test_boundary_040_is_uncertain(self):
+        r = _compute_concordance(0.40, "uncertain")
+        assert r["concordance"] == "CONCORDANT"
+        assert r["cxr_category"] == "uncertain"
+
+    # ---- Invalid assessment ----
+
+    def test_invalid_assessment_returns_uncertain(self):
+        r = _compute_concordance(0.80, "banana")
+        assert r["concordance"] == "UNCERTAIN"
+        assert "unexpected" in r["reasoning"].lower()
+
+    def test_empty_assessment_returns_uncertain(self):
+        r = _compute_concordance(0.50, "")
+        assert r["concordance"] == "UNCERTAIN"
+
+    def test_none_assessment_returns_uncertain(self):
+        r = _compute_concordance(0.50, None)
+        assert r["concordance"] == "UNCERTAIN"
+
+    # ---- Reasoning always present ----
+
+    def test_reasoning_always_present(self):
+        for prob, va in [(0.80, "fracture_likely"), (0.15, "fracture_likely"),
+                         (0.50, "uncertain"), (0.80, "garbage")]:
+            r = _compute_concordance(prob, va)
+            assert "reasoning" in r
+            assert len(r["reasoning"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# 12. Safety Audit Card rendering
+# ---------------------------------------------------------------------------
+
+class TestSafetyAuditCard:
+    """Test _make_safety_audit_card HTML output."""
+
+    def test_skipped_card(self):
+        html = _make_safety_audit_card({"skipped": True, "reason": "Disabled"})
+        assert "Skipped" in html
+        assert "Disabled" in html
+
+    def test_concordant_card(self):
+        html = _make_safety_audit_card({
+            "skipped": False,
+            "concordance": "CONCORDANT",
+            "observations": ["Normal cortical margins"],
+            "reasoning": "Both models agree.",
+        })
+        assert "Both models agree" in html
+        assert "Normal cortical margins" in html
+
+    def test_discordant_card_has_red_border(self):
+        html = _make_safety_audit_card({
+            "skipped": False,
+            "concordance": "DISCORDANT",
+            "observations": ["Cortical break seen"],
+            "reasoning": "Models disagree.",
+        })
+        assert "DISAGREE" in html
+        assert "3px solid" in html  # thicker border for DISCORDANT
+
+    def test_uncertain_card(self):
+        html = _make_safety_audit_card({
+            "skipped": False,
+            "concordance": "UNCERTAIN",
+            "observations": [],
+            "reasoning": "Inconclusive.",
+        })
+        assert "inconclusive" in html
+
+    def test_error_card(self):
+        html = _make_safety_audit_card({
+            "skipped": False,
+            "concordance": "UNCERTAIN",
+            "observations": [],
+            "reasoning": "Error occurred.",
+            "error": "Connection refused",
+        })
+        assert "Connection refused" in html
+
+    def test_observations_capped_at_5(self):
+        html = _make_safety_audit_card({
+            "skipped": False,
+            "concordance": "CONCORDANT",
+            "observations": [f"Finding {i}" for i in range(10)],
+            "reasoning": "Test.",
+        })
+        # Only first 5 should appear
+        assert "Finding 0" in html
+        assert "Finding 4" in html
+        assert "Finding 5" not in html
+
+    def test_disclaimer_always_present(self):
+        for concordance in ["CONCORDANT", "DISCORDANT", "UNCERTAIN"]:
+            html = _make_safety_audit_card({
+                "skipped": False,
+                "concordance": concordance,
+                "observations": [],
+                "reasoning": "Test.",
+            })
+            assert "not a diagnosis" in html
+
+
+# ---------------------------------------------------------------------------
+# 13. Safety Audit graceful degradation
+# ---------------------------------------------------------------------------
+
+class TestRunSafetyAuditGracefulDegradation:
+    """Test run_safety_audit returns skipped when disabled or unavailable."""
+
+    def test_audit_disabled_returns_skipped(self, monkeypatch):
+        monkeypatch.setattr("app.app.SAFETY_AUDIT_ENABLED", False)
+        img = Image.new("L", (256, 256), color=128)
+        result = run_safety_audit(img, {"probability": 0.5, "body_region": "Hand"})
+        assert result["skipped"] is True
+        assert "disabled" in result["reason"].lower()
+
+    def test_vision_unavailable_returns_skipped(self, monkeypatch):
+        monkeypatch.setattr("app.app.SAFETY_AUDIT_ENABLED", True)
+        monkeypatch.setattr("app.app.is_vision_available", lambda: False)
+        img = Image.new("L", (256, 256), color=128)
+        result = run_safety_audit(img, {"probability": 0.5, "body_region": "Hand"})
+        assert result["skipped"] is True
+        assert "not available" in result["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 14. Build audit findings section
+# ---------------------------------------------------------------------------
+
+class TestBuildAuditFindingsSection:
+    """Test _build_audit_findings_section prompt builder."""
+
+    def test_none_returns_empty(self):
+        assert _build_audit_findings_section(None) == ""
+
+    def test_skipped_audit_returns_empty(self):
+        assert _build_audit_findings_section({"skipped": True, "reason": "Disabled"}) == ""
+
+    def test_full_audit_contains_observations_and_concordance(self):
+        audit = {
+            "skipped": False,
+            "visual_assessment": "fracture_likely",
+            "concordance": "CONCORDANT",
+            "reasoning": "Both models agree on fracture.",
+            "observations": ["Cortical break in distal radius", "Soft tissue swelling"],
+            "confidence_note": "Good image quality",
+        }
+        result = _build_audit_findings_section(audit)
+        assert "Visual Safety Audit" in result
+        assert "fracture_likely" in result
+        assert "CONCORDANT" in result
+        assert "Both models agree" in result
+        assert "Cortical break" in result
+        assert "Soft tissue swelling" in result
+        assert "Good image quality" in result
+
+    def test_error_audit_with_no_visual_returns_empty(self):
+        """Audit that errored with no visual data returns empty."""
+        audit = {
+            "skipped": False,
+            "concordance": "UNCERTAIN",
+            "visual_assessment": "",
+            "observations": [],
+            "reasoning": "Error occurred.",
+            "error": "Connection refused",
+        }
+        result = _build_audit_findings_section(audit)
+        assert result == ""
+
+    def test_observations_capped_at_5(self):
+        audit = {
+            "skipped": False,
+            "visual_assessment": "uncertain",
+            "concordance": "UNCERTAIN",
+            "reasoning": "Test.",
+            "observations": [f"Finding {i}" for i in range(10)],
+        }
+        result = _build_audit_findings_section(audit)
+        assert "Finding 4" in result
+        assert "Finding 5" not in result
+
+    def test_advisory_language_present(self):
+        """Audit section should use advisory, not directive language."""
+        audit = {
+            "skipped": False,
+            "visual_assessment": "fracture_likely",
+            "concordance": "CONCORDANT",
+            "reasoning": "Agree.",
+            "observations": ["Break seen"],
+        }
+        result = _build_audit_findings_section(audit)
+        assert "advisory" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 15. Build clinical summary section
+# ---------------------------------------------------------------------------
+
+class TestBuildClinicalSummarySection:
+    """Test _build_clinical_summary_section prompt builder."""
+
+    def test_none_returns_empty(self):
+        assert _build_clinical_summary_section(None) == ""
+
+    def test_error_report_returns_empty(self):
+        report = {"error": "Cannot connect to Ollama.", "report_text": "", "structured_json": None}
+        assert _build_clinical_summary_section(report) == ""
+
+    def test_structured_json_contains_fields(self):
+        report = {
+            "error": None,
+            "report_text": "Some narrative.",
+            "structured_json": {
+                "primary_finding": "Suspected distal radius fracture",
+                "urgency": "URGENT",
+                "recommendation": "Splint and refer",
+                "differential": "Colles fracture",
+            },
+        }
+        result = _build_clinical_summary_section(report)
+        assert "Clinical AI Summary" in result
+        assert "Suspected distal radius fracture" in result
+        assert "URGENT" in result
+        assert "Splint and refer" in result
+        assert "Colles fracture" in result
+
+    def test_narrative_fallback_when_no_json(self):
+        report = {
+            "error": None,
+            "report_text": "This is a long narrative report from MedGemma.",
+            "structured_json": None,
+        }
+        result = _build_clinical_summary_section(report)
+        assert "Clinical AI Summary" in result
+        assert "long narrative report" in result
+
+    def test_narrative_fallback_truncated(self):
+        report = {
+            "error": None,
+            "report_text": "x" * 600,
+            "structured_json": None,
+        }
+        result = _build_clinical_summary_section(report)
+        assert "..." in result
+        # The truncated portion should be at most 500 chars
+        assert "x" * 501 not in result
+
+    def test_empty_report_text_no_json_returns_empty(self):
+        report = {"error": None, "report_text": "", "structured_json": None}
+        assert _build_clinical_summary_section(report) == ""
+
+    def test_translate_instruction_present(self):
+        """Section should instruct to translate into patient-friendly language."""
+        report = {
+            "error": None,
+            "report_text": "Narrative text.",
+            "structured_json": {"primary_finding": "Test"},
+        }
+        result = _build_clinical_summary_section(report)
+        assert "translate" in result.lower() or "patient-friendly" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 16. generate_report with audit/clinical chaining
+# ---------------------------------------------------------------------------
+
+class TestGenerateReportWithAuditFindings:
+    """Verify audit context is kept out of JSON prompt but injected into narrative fallback."""
+
+    def test_json_prompt_stays_clean(self, monkeypatch):
+        """JSON prompt should NOT contain audit data (keeps MedGemma 4B JSON-reliable)."""
+        captured_prompts = []
+
+        def mock_call_medgemma(prompt):
+            captured_prompts.append(prompt)
+            return {"response": '{"primary_finding": "Test", "urgency": "LOW", '
+                    '"recommendation": "None", "differential": "None", "clinical_note": ""}'}
+
+        monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
+
+        result_dict = {
+            "probability": 0.75,
+            "triage_level": "HIGH SUSPICION",
+            "body_region": "Hand",
+            "confidence": "moderate-high",
+            "latency_ms": 50,
+        }
+        audit = {
+            "skipped": False,
+            "visual_assessment": "fracture_likely",
+            "concordance": "CONCORDANT",
+            "reasoning": "Both models agree.",
+            "observations": ["Cortical break"],
+            "confidence_note": "Good quality",
+        }
+
+        report = generate_report(result_dict, "", report_type="clinical", audit_result=audit)
+
+        # JSON succeeded (only 1 call), and the prompt was clean
+        assert len(captured_prompts) == 1
+        assert "Cortical break" not in captured_prompts[0]
+        assert "Visual Safety Audit" not in captured_prompts[0]
+        assert report["structured_json"] is not None
+
+    def test_audit_findings_in_narrative_fallback(self, monkeypatch):
+        """When JSON fails, narrative fallback prompt should contain audit data."""
+        captured_prompts = []
+
+        def mock_call_medgemma(prompt):
+            captured_prompts.append(prompt)
+            if len(captured_prompts) == 1:
+                # JSON attempt fails
+                return {"response": "This is not valid JSON at all."}
+            else:
+                # Narrative fallback succeeds
+                return {"response": "Clinical summary with audit context."}
+
+        monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
+
+        result_dict = {
+            "probability": 0.75,
+            "triage_level": "HIGH SUSPICION",
+            "body_region": "Hand",
+            "confidence": "moderate-high",
+            "latency_ms": 50,
+        }
+        audit = {
+            "skipped": False,
+            "visual_assessment": "fracture_likely",
+            "concordance": "CONCORDANT",
+            "reasoning": "Both models agree.",
+            "observations": ["Cortical break"],
+            "confidence_note": "Good quality",
+        }
+
+        report = generate_report(result_dict, "", report_type="clinical", audit_result=audit)
+
+        # JSON failed, fell back to narrative (2 calls)
+        assert len(captured_prompts) == 2
+        # First call (JSON) was clean
+        assert "Cortical break" not in captured_prompts[0]
+        # Second call (narrative) has audit context
+        assert "Cortical break" in captured_prompts[1]
+        assert "Visual Safety Audit" in captured_prompts[1]
+        assert report["structured_json"] is None
+
+    def test_no_audit_still_works(self, monkeypatch):
+        """Clinical report without audit_result should still generate fine."""
+        captured_prompts = []
+
+        def mock_call_medgemma(prompt):
+            captured_prompts.append(prompt)
+            return {"response": '{"primary_finding": "Test", "urgency": "LOW", '
+                    '"recommendation": "None", "differential": "None", "clinical_note": ""}'}
+
+        monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
+
+        result_dict = {
+            "probability": 0.3,
+            "triage_level": "LOW SUSPICION",
+            "body_region": "Leg",
+            "confidence": "moderate-high",
+            "latency_ms": 50,
+        }
+
+        report = generate_report(result_dict, "", report_type="clinical")
+        assert report["error"] is None
+        assert "Visual Safety Audit" not in captured_prompts[0]
+
+
+class TestGenerateReportWithClinicalSummary:
+    """Verify clinical_summary is kept out of JSON prompt but injected into narrative fallback."""
+
+    def test_json_prompt_stays_clean(self, monkeypatch):
+        """JSON prompt should NOT contain clinical summary data."""
+        captured_prompts = []
+
+        def mock_call_medgemma(prompt):
+            captured_prompts.append(prompt)
+            return {"response": '{"summary": "Your results look okay.", '
+                    '"next_steps": "See your doctor.", "reassurance": "Everything is fine."}'}
+
+        monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
+
+        result_dict = {
+            "probability": 0.6,
+            "triage_level": "MODERATE SUSPICION",
+            "body_region": "Hip",
+            "confidence": "moderate",
+            "latency_ms": 50,
+        }
+        clinical = {
+            "error": None,
+            "report_text": "Narrative text.",
+            "structured_json": {
+                "primary_finding": "Possible femoral neck fracture",
+                "urgency": "MODERATE",
+                "recommendation": "CT scan recommended",
+                "differential": "Intertrochanteric fracture",
+            },
+        }
+
+        report = generate_report(
+            result_dict, "", report_type="patient", clinical_summary=clinical,
+        )
+
+        assert len(captured_prompts) == 1
+        assert "Possible femoral neck fracture" not in captured_prompts[0]
+        assert "Clinical AI Summary" not in captured_prompts[0]
+        assert report["structured_json"] is not None
+
+    def test_clinical_summary_in_narrative_fallback(self, monkeypatch):
+        """When JSON fails, narrative fallback prompt should contain clinical summary."""
+        captured_prompts = []
+
+        def mock_call_medgemma(prompt):
+            captured_prompts.append(prompt)
+            if len(captured_prompts) == 1:
+                return {"response": "Not valid JSON."}
+            else:
+                return {"response": "Patient-friendly explanation."}
+
+        monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
+
+        result_dict = {
+            "probability": 0.6,
+            "triage_level": "MODERATE SUSPICION",
+            "body_region": "Hip",
+            "confidence": "moderate",
+            "latency_ms": 50,
+        }
+        clinical = {
+            "error": None,
+            "report_text": "Narrative text.",
+            "structured_json": {
+                "primary_finding": "Possible femoral neck fracture",
+                "urgency": "MODERATE",
+                "recommendation": "CT scan recommended",
+                "differential": "Intertrochanteric fracture",
+            },
+        }
+
+        report = generate_report(
+            result_dict, "", report_type="patient", clinical_summary=clinical,
+        )
+
+        assert len(captured_prompts) == 2
+        assert "Clinical AI Summary" not in captured_prompts[0]
+        assert "Possible femoral neck fracture" in captured_prompts[1]
+        assert "Clinical AI Summary" in captured_prompts[1]
+
+    def test_no_clinical_summary_still_works(self, monkeypatch):
+        """Patient report without clinical_summary should still generate fine."""
+        captured_prompts = []
+
+        def mock_call_medgemma(prompt):
+            captured_prompts.append(prompt)
+            return {"response": '{"summary": "Normal.", "next_steps": "Wait.", '
+                    '"reassurance": "All good."}'}
+
+        monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
+
+        result_dict = {
+            "probability": 0.2,
+            "triage_level": "LOW SUSPICION",
+            "body_region": "Shoulder",
+            "confidence": "moderate-high",
+            "latency_ms": 50,
+        }
+
+        report = generate_report(result_dict, "", report_type="patient")
+        assert report["error"] is None
+        assert "Clinical AI Summary" not in captured_prompts[0]
+
+    def test_errored_clinical_summary_returns_empty_section(self, monkeypatch):
+        """If clinical report errored, patient prompt should not contain summary."""
+        captured_prompts = []
+
+        def mock_call_medgemma(prompt):
+            captured_prompts.append(prompt)
+            return {"response": '{"summary": "Normal.", "next_steps": "Wait.", '
+                    '"reassurance": "All good."}'}
+
+        monkeypatch.setattr("app.app._call_medgemma", mock_call_medgemma)
+
+        result_dict = {
+            "probability": 0.5,
+            "triage_level": "MODERATE SUSPICION",
+            "body_region": "Hand",
+            "confidence": "moderate",
+            "latency_ms": 50,
+        }
+        errored_clinical = {
+            "error": "MedGemma timed out.",
+            "report_text": "",
+            "structured_json": None,
+        }
+
+        generate_report(
+            result_dict, "", report_type="patient", clinical_summary=errored_clinical,
+        )
+
+        assert "Clinical AI Summary" not in captured_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# 17. MedGemma region detection
+# ---------------------------------------------------------------------------
+
+class TestDetectRegionMedgemma:
+    """Test _detect_region_medgemma with mocked MedGemma responses."""
+
+    def _make_image(self):
+        return Image.new("L", (256, 256), color=128)
+
+    def test_returns_unknown_when_vision_unavailable(self, monkeypatch):
+        monkeypatch.setattr("app.app.is_vision_available", lambda: False)
+        region, detected = _detect_region_medgemma(self._make_image())
+        assert region == "Unknown"
+        assert detected is False
+
+    def test_valid_json_response(self, monkeypatch):
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        for body_region in ("Hand", "Leg", "Hip", "Shoulder"):
+            monkeypatch.setattr(
+                "app.app._call_medgemma_vision",
+                lambda prompt, img, r=body_region: {"response": f'{{"region": "{r}"}}'},
+            )
+            region, detected = _detect_region_medgemma(self._make_image())
+            assert region == body_region
+            assert detected is True
+
+    def test_invalid_json_falls_back_to_string_match(self, monkeypatch):
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        monkeypatch.setattr(
+            "app.app._call_medgemma_vision",
+            lambda prompt, img: {"response": "The image shows a Hand X-ray."},
+        )
+        region, detected = _detect_region_medgemma(self._make_image())
+        assert region == "Hand"
+        assert detected is True
+
+    def test_novel_region_accepted(self, monkeypatch):
+        """Non-FracAtlas regions like Elbow should be accepted."""
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        monkeypatch.setattr(
+            "app.app._call_medgemma_vision",
+            lambda prompt, img: {"response": '{"region": "Elbow"}'},
+        )
+        region, detected = _detect_region_medgemma(self._make_image())
+        assert region == "Elbow"
+        assert detected is True
+
+    def test_novel_region_title_cased(self, monkeypatch):
+        """Multi-word regions should be title-cased."""
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        monkeypatch.setattr(
+            "app.app._call_medgemma_vision",
+            lambda prompt, img: {"response": '{"region": "lower back"}'},
+        )
+        region, detected = _detect_region_medgemma(self._make_image())
+        assert region == "Lower Back"
+        assert detected is True
+
+    def test_fallback_string_match_novel_region(self, monkeypatch):
+        """Free-text mentioning a common region should match via fallback."""
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        monkeypatch.setattr(
+            "app.app._call_medgemma_vision",
+            lambda prompt, img: {"response": "This appears to be an Elbow X-ray."},
+        )
+        region, detected = _detect_region_medgemma(self._make_image())
+        assert region == "Elbow"
+        assert detected is True
+
+    def test_exception_returns_unknown(self, monkeypatch):
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+
+        def raise_error(prompt, img):
+            raise RuntimeError("Connection refused")
+
+        monkeypatch.setattr("app.app._call_medgemma_vision", raise_error)
+        region, detected = _detect_region_medgemma(self._make_image())
+        assert region == "Unknown"
+        assert detected is False
+
+    def test_empty_response_returns_unknown(self, monkeypatch):
+        monkeypatch.setattr("app.app.is_vision_available", lambda: True)
+        monkeypatch.setattr(
+            "app.app._call_medgemma_vision",
+            lambda prompt, img: {"response": ""},
+        )
+        region, detected = _detect_region_medgemma(self._make_image())
+        assert region == "Unknown"
+        assert detected is False
