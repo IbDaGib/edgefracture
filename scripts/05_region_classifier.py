@@ -11,8 +11,8 @@ Usage:
     python scripts/05_region_classifier.py
 """
 
+import hashlib
 import json
-import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -78,14 +78,21 @@ def main():
     for i, label in enumerate(labels):
         print(f"{label:>12s}", "  ".join(f"{cm[i,j]:>8d}" for j in range(len(labels))))
 
-    # ---- Train final deployment model on all data and save ----
+    # ---- Train final deployment model on all data and save (joblib + SHA-256) ----
+    import joblib
+
     model.fit(X, y)
-    output_path = OUTPUT_DIR / "region_classifier.pkl"
-    with open(output_path, "wb") as f:
-        pickle.dump(model, f)
+    output_path = OUTPUT_DIR / "region_classifier.joblib"
+    joblib.dump(model, output_path)
+
+    # Write SHA-256 sidecar for integrity verification on load
+    sha256 = hashlib.sha256(output_path.read_bytes()).hexdigest()
+    hash_path = output_path.with_suffix(output_path.suffix + ".sha256")
+    hash_path.write_text(sha256 + "\n")
 
     size_kb = output_path.stat().st_size / 1024
     print(f"\nSaved: {output_path} ({size_kb:.1f} KB)")
+    print(f"  Hash: {hash_path} ({sha256[:16]}...)")
     print(f"Classes: {list(model.classes_)}")
 
     # ---- Save summary ----

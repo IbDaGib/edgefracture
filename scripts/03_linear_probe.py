@@ -52,6 +52,40 @@ RANDOM_SEED = 42
 
 
 # ============================================================
+# Bootstrap Confidence Intervals
+# ============================================================
+
+def bootstrap_auc_ci(y_true, y_score, n_bootstraps=2000, ci=0.95, seed=42):
+    """Compute bootstrap confidence interval for AUC.
+
+    Especially important for small-sample regions like Hip and Shoulder
+    (only ~10 fracture cases each), where point-estimate AUC can be
+    misleading.
+
+    Returns (lower, upper) bounds of the CI, or (nan, nan) if too few
+    valid bootstrap samples were obtained.
+    """
+    rng = np.random.RandomState(seed)
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    aucs = []
+    for _ in range(n_bootstraps):
+        idx = rng.randint(0, len(y_true), len(y_true))
+        if len(np.unique(y_true[idx])) < 2:
+            continue
+        aucs.append(roc_auc_score(y_true[idx], y_score[idx]))
+    if len(aucs) < 100:
+        # Too few valid resamples — CI is unreliable
+        return float("nan"), float("nan")
+    lower = np.percentile(aucs, (1 - ci) / 2 * 100)
+    upper = np.percentile(aucs, (1 + ci) / 2 * 100)
+    return lower, upper
+
+
+CI_WIDTH_UNRELIABLE_THRESHOLD = 0.15  # Flag regions with CI width > this
+
+
+# ============================================================
 # Linear Probe Training
 # ============================================================
 
@@ -183,29 +217,79 @@ def run_per_region(
     y: np.ndarray,
     body_regions: np.ndarray,
 ) -> dict:
-    """Run full cross-validation per body region."""
+    """Run full cross-validation per body region with bootstrap 95% CIs.
+
+    For regions with very few fracture cases (e.g. Hip and Shoulder with
+    ~10 each), the bootstrap CI exposes how wide the uncertainty really
+    is, and regions whose CI width exceeds CI_WIDTH_UNRELIABLE_THRESHOLD
+    are flagged as statistically unreliable.
+    """
     region_results = {}
-    
+
     for region in np.unique(body_regions):
         if region == "unknown":
             continue
-        
+
         mask = body_regions == region
         X_r, y_r = X[mask], y[mask]
-        
+
         if len(y_r) < 20 or y_r.sum() < 5:
             print(f"  Skipping {region}: too few samples ({len(y_r)} total, {y_r.sum()} fractures)")
             continue
-        
+
         # Use fewer folds if data is scarce
         n_folds = min(N_FOLDS, int(y_r.sum()))
         n_folds = max(2, n_folds)
-        
+
         result = run_cross_validation(X_r, y_r, "all", n_folds=n_folds)
+
+        # --- Bootstrap 95 % CI for AUC ---
+        # Collect pooled out-of-fold predictions across all CV folds so
+        # the bootstrap operates on the same held-out scores that
+        # produced mean_auc.
+        all_y_true = []
+        all_y_score = []
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_SEED)
+        for train_idx, test_idx in skf.split(X_r, y_r):
+            _scaler = StandardScaler()
+            _X_tr = _scaler.fit_transform(X_r[train_idx])
+            _X_te = _scaler.transform(X_r[test_idx])
+            _clf = LogisticRegression(
+                C=1.0, max_iter=1000, solver="lbfgs",
+                class_weight="balanced", random_state=RANDOM_SEED,
+            )
+            _clf.fit(_X_tr, y_r[train_idx])
+            _scores = _clf.predict_proba(_X_te)[:, 1]
+            all_y_true.extend(y_r[test_idx])
+            all_y_score.extend(_scores)
+
+        all_y_true = np.array(all_y_true)
+        all_y_score = np.array(all_y_score)
+        ci_lower, ci_upper = bootstrap_auc_ci(all_y_true, all_y_score)
+        ci_width = ci_upper - ci_lower
+
+        result["auc_ci_lower"] = round(float(ci_lower), 4) if not np.isnan(ci_lower) else None
+        result["auc_ci_upper"] = round(float(ci_upper), 4) if not np.isnan(ci_upper) else None
+        result["auc_ci_width"] = round(float(ci_width), 4) if not np.isnan(ci_width) else None
+        result["statistically_unreliable"] = (
+            ci_width > CI_WIDTH_UNRELIABLE_THRESHOLD if not np.isnan(ci_width) else True
+        )
+
         region_results[region] = result
-        print(f"  {region:>10}: AUC={result['mean_auc']:.4f} ± {result['std_auc']:.4f} "
-              f"(n={len(y_r)}, fractures={y_r.sum()})")
-    
+
+        # --- Pretty-print with CI ---
+        ci_str = ""
+        if result["auc_ci_lower"] is not None:
+            ci_str = (f"  95% CI [{result['auc_ci_lower']:.3f}, "
+                       f"{result['auc_ci_upper']:.3f}]")
+            if result["statistically_unreliable"]:
+                ci_str += "  ** WIDE CI - statistically unreliable **"
+        else:
+            ci_str = "  95% CI unavailable"
+
+        print(f"  {region:>10}: AUC={result['mean_auc']:.4f} +/- {result['std_auc']:.4f}"
+              f"{ci_str} (n={len(y_r)}, fractures={int(y_r.sum())})")
+
     return region_results
 
 
@@ -383,6 +467,19 @@ def _calibrate_temperature(logits, y_true):
     return result.x
 
 
+def _save_with_hash(obj, path: Path):
+    """Save object with joblib and write a SHA-256 sidecar for integrity verification."""
+    import hashlib
+    import joblib
+
+    joblib.dump(obj, path)
+
+    sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    hash_path = path.with_suffix(path.suffix + ".sha256")
+    hash_path.write_text(sha256 + "\n")
+    print(f"  Hash: {hash_path} ({sha256[:16]}...)")
+
+
 def save_deployment_model(X, y, output_dir: Path):
     """Train deployment model on 80% of data, evaluate on 20% held-out set.
 
@@ -390,9 +487,9 @@ def save_deployment_model(X, y, output_dir: Path):
       1. Validate the actual deployed model (separate from CV metrics).
       2. Calibrate the temperature parameter for probability scaling.
 
-    Saves model, scaler, calibrated temperature, and held-out metrics to pkl.
+    Saves model, scaler, calibrated temperature, and held-out metrics via
+    joblib with a SHA-256 integrity hash (replaces unsafe pickle).
     """
-    import pickle
 
     # --- Hold out 20% for final evaluation (stratified) ---
     X_train, X_test, y_train, y_test = train_test_split(
@@ -446,15 +543,14 @@ def save_deployment_model(X, y, output_dir: Path):
     uncalibrated_ll = log_loss(y_test, np.clip(y_score, 1e-7, 1 - 1e-7))
     calibrated_ll = log_loss(y_test, np.clip(calibrated_probs, 1e-7, 1 - 1e-7))
 
-    # --- Save everything ---
-    model_path = output_dir / "fracture_probe.pkl"
-    with open(model_path, "wb") as f:
-        pickle.dump({
-            "model": clf,
-            "scaler": scaler,
-            "temperature": temperature,
-            "holdout_metrics": holdout_metrics,
-        }, f)
+    # --- Save everything (joblib + SHA-256 hash) ---
+    model_path = output_dir / "fracture_probe.joblib"
+    _save_with_hash({
+        "model": clf,
+        "scaler": scaler,
+        "temperature": temperature,
+        "holdout_metrics": holdout_metrics,
+    }, model_path)
 
     # --- Print results, clearly distinguishing CV vs held-out ---
     print(f"\n  Deployment model saved: {model_path}")
@@ -596,14 +692,17 @@ def main():
         print(f"{n:>20} {r['mean_auc']:>10.4f} {r['mean_sensitivity']:>12.4f} {r['mean_specificity']:>12.4f}")
     
     if region_results:
-        print(f"\n{'Body Region':>20} {'AUC':>10} {'N Images':>10} {'N Fractures':>12}")
-        print("-" * 56)
+        print(f"\n{'Body Region':>20} {'AUC':>10} {'95% CI':>20} {'N Images':>10} {'N Fractures':>12} {'Reliable?':>12}")
+        print("-" * 88)
         for region in sorted(region_results.keys()):
             r = region_results[region]
-            fr = r["fold_results"][0] if r["fold_results"] else {}
-            # Get from original data
             rmask = body_regions == region
-            print(f"{region:>20} {r['mean_auc']:>10.4f} {rmask.sum():>10} {y[rmask].sum():>12}")
+            if r.get("auc_ci_lower") is not None:
+                ci_str = f"[{r['auc_ci_lower']:.3f}, {r['auc_ci_upper']:.3f}]"
+            else:
+                ci_str = "N/A"
+            reliable = "Yes" if not r.get("statistically_unreliable", True) else "NO"
+            print(f"{region:>20} {r['mean_auc']:>10.4f} {ci_str:>20} {rmask.sum():>10} {y[rmask].sum():>12} {reliable:>12}")
     
     print(f"\nAll results saved to: {args.output_dir}")
     print("Next step: python scripts/04_edge_benchmarks.py")

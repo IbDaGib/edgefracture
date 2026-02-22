@@ -12,15 +12,20 @@ Two HAI-DEF models:
 """
 
 import argparse
+import hashlib
 import io
 import json
+import logging
 import os
 import pickle
 import re
+import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import gradio as gr
+import joblib
 import numpy as np
 import requests
 from PIL import Image
@@ -36,16 +41,83 @@ TRIAGE_THRESHOLDS = {"red": 0.70, "yellow": 0.40}
 BODY_REGIONS = ["Hand", "Leg", "Hip", "Shoulder", "Unknown"]
 
 LINEAR_PROBE_PATH = os.environ.get(
-    "PROBE_PATH", "results/linear_probe/fracture_probe.pkl"
+    "PROBE_PATH", "results/linear_probe/fracture_probe.joblib"
 )
 REGION_CLASSIFIER_PATH = os.environ.get(
-    "REGION_PATH", "results/linear_probe/region_classifier.pkl"
+    "REGION_PATH", "results/linear_probe/region_classifier.joblib"
 )
 CXR_MODEL_PATH = os.environ.get(
     "CXR_MODEL_PATH", "models/cxr-foundation/elixr-c-v2-pooled"
 )
 
 IMAGE_SIZE = 1024  # CXR Foundation input size
+
+
+# ---------------------------------------------------------------------------
+# Prediction Audit Logger (FIX #15)
+# ---------------------------------------------------------------------------
+
+class PredictionLogger:
+    """JSON-lines audit logger for all predictions.
+
+    Writes one JSON object per line to a rotating log file.  Privacy-safe:
+    never logs images or full clinical-context text.
+    """
+
+    def __init__(self, log_dir: str = "logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger = logging.getLogger("edgefracture.predictions")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+        if not self.logger.handlers:
+            handler = RotatingFileHandler(
+                self.log_dir / "predictions.jsonl",
+                maxBytes=10 * 1024 * 1024,  # 10 MB
+                backupCount=5,
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self.logger.addHandler(handler)
+
+    def log_prediction(
+        self,
+        result: dict,
+        body_region_input: str = "Unknown",
+        clinical_context: str = "",
+        report_type: str = "",
+    ):
+        """Record a single prediction to the audit log.
+
+        Args:
+            result: The classification result dict from FractureClassifier.classify().
+            body_region_input: The body-region value the user originally selected.
+            clinical_context: Raw clinical context string (only its *presence*
+                is logged, never the content -- for patient privacy).
+            report_type: "clinical", "patient", or "" for triage-only calls.
+        """
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "probability": result.get("probability"),
+            "triage_level": result.get("triage_level"),
+            "body_region": result.get("body_region"),
+            "body_region_input": body_region_input,
+            "region_auto_detected": result.get("region_auto_detected"),
+            "model_used": result.get("model_used"),
+            "latency_ms": result.get("latency_ms"),
+            "confidence": result.get("confidence"),
+            "image_warnings": result.get("image_warnings"),
+        }
+        if report_type:
+            entry["report_type"] = report_type
+        if clinical_context:
+            entry["had_clinical_context"] = True
+        self.logger.info(json.dumps(entry))
+
+
+prediction_logger = PredictionLogger()
+
 
 # ---------------------------------------------------------------------------
 # CXR Foundation + Linear Probe Classifier
@@ -68,13 +140,70 @@ class FractureClassifier:
         self._tf = None
         self._try_load()
 
+    # ---- Secure model loading helpers ----
+
+    @staticmethod
+    def _verify_hash(model_path: str) -> bool:
+        """Verify SHA-256 hash of a model file against its sidecar .sha256 file.
+
+        Returns True if the hash matches or no sidecar exists (first-run
+        tolerance). Returns False only when a sidecar exists but the hash
+        does not match, indicating the file may have been tampered with.
+        """
+        hash_path = Path(model_path).with_suffix(
+            Path(model_path).suffix + ".sha256"
+        )
+        if not hash_path.exists():
+            print(f"  (no .sha256 sidecar for {model_path} -- skipping verification)")
+            return True
+
+        expected = hash_path.read_text().strip()
+        actual = hashlib.sha256(Path(model_path).read_bytes()).hexdigest()
+        if actual != expected:
+            print(f"  SHA-256 MISMATCH for {model_path}!")
+            print(f"    expected: {expected}")
+            print(f"    actual:   {actual}")
+            return False
+        return True
+
+    @staticmethod
+    def _load_model_file(path: str):
+        """Load a model file, preferring .joblib with hash verification,
+        falling back to legacy .pkl files for backwards compatibility."""
+        p = Path(path)
+
+        # --- Try .joblib (preferred, safer) ---
+        if p.suffix == ".joblib" and p.exists():
+            if not FractureClassifier._verify_hash(str(p)):
+                raise RuntimeError(
+                    f"Integrity check failed for {p} -- refusing to load"
+                )
+            return joblib.load(p), str(p)
+
+        # --- Try .joblib variant if a .pkl path was given ---
+        joblib_variant = p.with_suffix(".joblib")
+        if joblib_variant.exists():
+            if not FractureClassifier._verify_hash(str(joblib_variant)):
+                raise RuntimeError(
+                    f"Integrity check failed for {joblib_variant} -- refusing to load"
+                )
+            return joblib.load(joblib_variant), str(joblib_variant)
+
+        # --- Fallback: legacy .pkl (backwards compatibility) ---
+        if p.exists():
+            print(f"  WARNING: Loading legacy pickle file {p}. "
+                  f"Re-run training scripts to save as .joblib with hash verification.")
+            with open(p, "rb") as f:
+                return pickle.load(f), str(p)
+
+        raise FileNotFoundError(f"No model file found at {p} or {joblib_variant}")
+
     def _try_load(self):
         # --- Load linear probe ---
         self.temperature = None
-        if LINEAR_PROBE_PATH and os.path.exists(LINEAR_PROBE_PATH):
+        if LINEAR_PROBE_PATH:
             try:
-                with open(LINEAR_PROBE_PATH, "rb") as f:
-                    data = pickle.load(f)
+                data, actual_path = self._load_model_file(LINEAR_PROBE_PATH)
                 if isinstance(data, dict):
                     self.probe = data["model"]
                     self.scaler = data.get("scaler")
@@ -83,23 +212,27 @@ class FractureClassifier:
                     self.probe = data
                 self.probe_loaded = True
                 if self.temperature is not None:
-                    print(f"✓ Linear probe loaded from {LINEAR_PROBE_PATH} "
+                    print(f"Linear probe loaded from {actual_path} "
                           f"(calibrated T={self.temperature:.4f})")
                 else:
-                    print(f"✓ Linear probe loaded from {LINEAR_PROBE_PATH}")
+                    print(f"Linear probe loaded from {actual_path}")
+            except FileNotFoundError:
+                pass  # Will be reported below
             except Exception as e:
-                print(f"⚠ Could not load linear probe: {e}")
+                print(f"Could not load linear probe: {e}")
 
         # --- Load region classifier ---
-        if REGION_CLASSIFIER_PATH and os.path.exists(REGION_CLASSIFIER_PATH):
+        if REGION_CLASSIFIER_PATH:
             try:
-                with open(REGION_CLASSIFIER_PATH, "rb") as f:
-                    self.region_classifier = pickle.load(f)
+                data, actual_path = self._load_model_file(REGION_CLASSIFIER_PATH)
+                self.region_classifier = data
                 self.region_loaded = True
-                print(f"✓ Region classifier loaded from {REGION_CLASSIFIER_PATH}")
+                print(f"Region classifier loaded from {actual_path}")
                 print(f"  Classes: {list(self.region_classifier.classes_)}")
+            except FileNotFoundError:
+                pass  # Will be reported below
             except Exception as e:
-                print(f"⚠ Could not load region classifier: {e}")
+                print(f"Could not load region classifier: {e}")
 
         # --- Load CXR Foundation vision model ---
         if CXR_MODEL_PATH and os.path.exists(CXR_MODEL_PATH):
@@ -114,16 +247,16 @@ class FractureClassifier:
 
                 self.vision_model = tf.saved_model.load(CXR_MODEL_PATH)
                 self.model_loaded = True
-                print(f"✓ CXR Foundation loaded from {CXR_MODEL_PATH}")
+                print(f"CXR Foundation loaded from {CXR_MODEL_PATH}")
             except ImportError:
-                print("⚠ TensorFlow not available — CXR Foundation won't load")
+                print("TensorFlow not available -- CXR Foundation won't load")
             except Exception as e:
-                print(f"⚠ Could not load CXR Foundation: {e}")
+                print(f"Could not load CXR Foundation: {e}")
 
         if not self.model_loaded:
-            print("ℹ CXR Foundation not loaded — running in PLACEHOLDER mode")
+            print("CXR Foundation not loaded -- running in PLACEHOLDER mode")
         if not self.probe_loaded:
-            print("ℹ Linear probe not loaded — running in PLACEHOLDER mode")
+            print("Linear probe not loaded -- running in PLACEHOLDER mode")
 
     # ---- Image preprocessing (matches extraction script) ----
 
@@ -657,13 +790,21 @@ def get_performance_context() -> str:
         "**never designed for**.\n"
     )
     lines.append("#### Per-Region AUC (Linear Probe, 5-fold CV)\n")
-    lines.append("| Body Region | Images | Fractures | AUC |")
-    lines.append("|-------------|--------|-----------|-----|")
-    lines.append("| Hand | 1,510 | 438 | **0.850** |")
-    lines.append("| Hip | 179 | 10 | **0.864** |")
-    lines.append("| Leg | 2,237 | 259 | **0.888** |")
-    lines.append("| Shoulder | 98 | 10 | **0.848** |")
-    lines.append("| **Overall** | **4,024** | **717** | **0.882** |")
+    lines.append("| Body Region | Images | Fractures | AUC | 95% Bootstrap CI |")
+    lines.append("|-------------|--------|-----------|-----|------------------|")
+    lines.append("| Hand | 1,510 | 438 | **0.850** | [0.823, 0.876] |")
+    lines.append("| Hip | 179 | 10 | **0.864** | [0.706, 0.972] * |")
+    lines.append("| Leg | 2,237 | 259 | **0.888** | [0.861, 0.913] |")
+    lines.append("| Shoulder | 98 | 10 | **0.848** | [0.667, 0.976] * |")
+    lines.append("| **Overall** | **4,024** | **717** | **0.882** | [0.864, 0.899] |")
+    lines.append("")
+    lines.append(
+        "*\\* Hip and Shoulder each have only 10 fracture cases, producing wide "
+        "confidence intervals (CI width > 0.15). Their AUC point estimates should "
+        "be interpreted with caution — the true AUC could plausibly range from "
+        "~0.67 to ~0.98. More labeled data for these regions would substantially "
+        "narrow the uncertainty.*"
+    )
 
     lines.append("\n#### Data Efficiency — AUC vs. Training Examples\n")
     lines.append(
@@ -713,7 +854,13 @@ def run_batch_triage(files, body_region):
         filename = Path(filepath).name
         try:
             img = Image.open(filepath)
-            result = classifier.classify(img, body_region)
+            result = get_classifier().classify(img, body_region)
+
+            # FIX #15: audit-log each batch prediction
+            prediction_logger.log_prediction(
+                result, body_region_input=body_region,
+            )
+
             color_emoji = {"red": "🔴", "yellow": "🟡", "green": "🟢"}[
                 result["triage_color"]
             ]
@@ -768,7 +915,18 @@ def run_batch_triage(files, body_region):
 # UI State Management
 # ---------------------------------------------------------------------------
 
-classifier = FractureClassifier()
+_classifier = None
+_classifier_lock = threading.Lock()
+
+
+def get_classifier() -> FractureClassifier:
+    """Thread-safe lazy singleton for the classifier."""
+    global _classifier
+    if _classifier is None:
+        with _classifier_lock:
+            if _classifier is None:  # double-checked locking
+                _classifier = FractureClassifier()
+    return _classifier
 
 
 def check_ollama_status():
@@ -798,7 +956,14 @@ def step_triage(image, body_region, clinical_context):
     pil_image = (
         Image.fromarray(image) if not isinstance(image, Image.Image) else image
     )
-    result = classifier.classify(pil_image, body_region)
+    result = get_classifier().classify(pil_image, body_region)
+
+    # FIX #15: audit-log every triage prediction
+    prediction_logger.log_prediction(
+        result,
+        body_region_input=body_region,
+        clinical_context=clinical_context or "",
+    )
 
     state = {
         "result": result,
@@ -1160,9 +1325,9 @@ def build_ui():
                             ### Configuration
                             - **Ollama URL:** `{OLLAMA_BASE_URL}`
                             - **MedGemma:** `{MEDGEMMA_MODEL}`
-                            - **CXR Foundation:** `{'Loaded ✓' if classifier.model_loaded else 'Not loaded — placeholder mode'}`
-                            - **Linear probe:** `{'Loaded ✓ (0.882 AUC)' if classifier.probe_loaded else 'Not loaded — placeholder mode'}`
-                            - **Region classifier:** `{'Loaded ✓ — auto-detects body region' if classifier.region_loaded else 'Not loaded — manual selection'}`
+                            - **CXR Foundation:** `{'Loaded ✓' if get_classifier().model_loaded else 'Not loaded — placeholder mode'}`
+                            - **Linear probe:** `{'Loaded ✓ (0.882 AUC)' if get_classifier().probe_loaded else 'Not loaded — placeholder mode'}`
+                            - **Region classifier:** `{'Loaded ✓ — auto-detects body region' if get_classifier().region_loaded else 'Not loaded — manual selection'}`
                             """
                         )
 
@@ -1229,9 +1394,9 @@ if __name__ == "__main__":
     print(f"  CXR Model:    {CXR_MODEL_PATH or 'Not configured'}")
     print(f"  Linear Probe: {LINEAR_PROBE_PATH or 'Not configured'}")
     print(f"  Region Model: {REGION_CLASSIFIER_PATH or 'Not configured'}")
-    print(f"  CXR loaded:   {'✓' if classifier.model_loaded else '✗ (placeholder mode)'}")
-    print(f"  Probe loaded: {'✓' if classifier.probe_loaded else '✗ (placeholder mode)'}")
-    print(f"  Region loaded:{'✓ (auto-detect)' if classifier.region_loaded else '✗ (manual select)'}")
+    print(f"  CXR loaded:   {'✓' if get_classifier().model_loaded else '✗ (placeholder mode)'}")
+    print(f"  Probe loaded: {'✓' if get_classifier().probe_loaded else '✗ (placeholder mode)'}")
+    print(f"  Region loaded:{'✓ (auto-detect)' if get_classifier().region_loaded else '✗ (manual select)'}")
     print("=" * 60)
 
     app = build_ui()
