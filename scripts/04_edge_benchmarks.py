@@ -138,78 +138,127 @@ class JetsonMonitor:
 # ============================================================
 
 def benchmark_cxr_foundation(n_images: int = 50) -> dict:
-    """Benchmark CXR Foundation inference speed."""
-    import torch
+    """Benchmark CXR Foundation inference speed using TensorFlow SavedModel.
+
+    Matches the real production inference path in app/app.py:
+      - PIL for image preprocessing (grayscale, resize)
+      - tf.train.Example serialization
+      - tf.saved_model.load() for the model
+    """
+    import io
     from PIL import Image
-    from torchvision import transforms
-    
+
+    IMAGE_SIZE = 1024  # Must match app.py
+    CXR_MODEL_PATH = os.environ.get(
+        "CXR_MODEL_PATH", "models/cxr-foundation/elixr-c-v2-pooled"
+    )
+
     print(f"\n--- CXR Foundation Benchmark ({n_images} images) ---")
-    
-    transform = transforms.Compose([
-        transforms.Resize((1280, 1280)),
-        transforms.Grayscale(1),
-        transforms.ToTensor(),
-    ])
-    
-    # Try to load model
+
+    # ----- helpers matching app.py's _preprocess_image / _extract_embedding -----
+
+    def _preprocess_image(tf, image: Image.Image) -> bytes:
+        """Convert PIL image to serialized tf.Example (CXR Foundation input)."""
+        img = image.convert("L")  # Grayscale
+        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS)
+
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        png_bytes = buffer.getvalue()
+
+        feature = {
+            "image/encoded": tf.train.Feature(
+                bytes_list=tf.train.BytesList(value=[png_bytes])
+            ),
+        }
+        example = tf.train.Example(
+            features=tf.train.Features(feature=feature)
+        )
+        return example.SerializeToString()
+
+    def _run_inference(tf, model, serialized_example: bytes):
+        """Run model inference matching app.py's _extract_embedding."""
+        input_tensor = tf.constant([serialized_example])
+
+        try:
+            if (hasattr(model, "signatures")
+                    and "serving_default" in model.signatures):
+                serve_fn = model.signatures["serving_default"]
+                input_keys = list(serve_fn.structured_input_signature[1].keys())
+                output = serve_fn(**{input_keys[0]: input_tensor})
+            else:
+                output = model(input_tensor)
+        except Exception:
+            output = model(inputs=input_tensor)
+
+        if isinstance(output, dict):
+            keys = list(output.keys())
+            return output[keys[0]].numpy()
+        return output.numpy()
+
+    # ----- Try to load model via TensorFlow -----
+
     try:
-        from scripts.a01_extract_embeddings import load_cxr_foundation
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-        model_info = load_cxr_foundation(Path("models/cxr-foundation"), device)
+        import tensorflow as tf
+        try:
+            import tensorflow_text  # noqa: F401 — registers SentencepieceOp
+        except ImportError:
+            pass
+
+        tf.get_logger().setLevel("ERROR")
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+        if not os.path.exists(CXR_MODEL_PATH):
+            raise FileNotFoundError(f"Model path not found: {CXR_MODEL_PATH}")
+
+        model = tf.saved_model.load(CXR_MODEL_PATH)
+        print(f"  Loaded CXR Foundation from {CXR_MODEL_PATH}")
+
     except Exception as e:
-        print(f"Could not load CXR Foundation: {e}")
-        print("Creating synthetic benchmark with dummy model...")
-        # Synthetic benchmark for testing the pipeline
+        print(f"Could not load CXR Foundation via TensorFlow: {e}")
+        print("Creating SYNTHETIC benchmark (not measuring real inference)...")
+        # Synthetic fallback — clearly labelled so results aren't confused
         latencies = np.random.exponential(0.5, n_images) + 0.3
         return {
-            "model": "cxr-foundation (synthetic)",
+            "model": "cxr-foundation (SYNTHETIC)",
             "n_images": n_images,
             "mean_latency_ms": np.mean(latencies) * 1000,
             "median_latency_ms": np.median(latencies) * 1000,
             "p95_latency_ms": np.percentile(latencies, 95) * 1000,
             "throughput_img_per_min": 60 / np.mean(latencies),
-            "note": "SYNTHETIC — model not loaded",
+            "note": "SYNTHETIC — TF model not loaded; does NOT reflect real latency",
         }
-    
-    # Create dummy images for benchmarking
+
+    # ----- Create synthetic PIL images for benchmarking -----
+
     latencies = []
-    
-    # Warmup
-    dummy = torch.randn(1, 1, 1280, 1280).to(device)
+
+    def _make_dummy_image() -> Image.Image:
+        """Generate a random grayscale PIL image of the expected size."""
+        arr = np.random.randint(0, 256, (IMAGE_SIZE, IMAGE_SIZE), dtype=np.uint8)
+        return Image.fromarray(arr, mode="L")
+
+    # Warmup (3 forward passes)
+    warmup_img = _make_dummy_image()
+    warmup_ex = _preprocess_image(tf, warmup_img)
     for _ in range(3):
-        with torch.no_grad():
-            _ = model_info["model"](dummy)
-    
+        _run_inference(tf, model, warmup_ex)
+
     # Benchmark
     for i in range(n_images):
-        img = torch.randn(1, 1, 1280, 1280).to(device)
-        
-        if device == "cuda":
-            torch.cuda.synchronize()
+        img = _make_dummy_image()
+        serialized = _preprocess_image(tf, img)
+
         t0 = time.perf_counter()
-        
-        with torch.no_grad():
-            _ = model_info["model"](img)
-        
-        if device == "cuda":
-            torch.cuda.synchronize()
+        _run_inference(tf, model, serialized)
         t1 = time.perf_counter()
-        
+
         latencies.append(t1 - t0)
-    
-    # GPU memory
-    gpu_mem_mb = 0
-    if torch.cuda.is_available():
-        gpu_mem_mb = torch.cuda.max_memory_allocated() / (1024**2)
-    
+
     return {
         "model": "cxr-foundation",
-        "device": device,
+        "framework": "tensorflow",
+        "device": "cpu",  # TF will log actual device; kept for schema compat
         "n_images": n_images,
         "mean_latency_ms": np.mean(latencies) * 1000,
         "median_latency_ms": np.median(latencies) * 1000,
@@ -217,7 +266,6 @@ def benchmark_cxr_foundation(n_images: int = 50) -> dict:
         "min_latency_ms": np.min(latencies) * 1000,
         "max_latency_ms": np.max(latencies) * 1000,
         "throughput_img_per_min": 60 / np.mean(latencies),
-        "gpu_mem_peak_mb": gpu_mem_mb,
         "latencies_ms": [l * 1000 for l in latencies],
     }
 

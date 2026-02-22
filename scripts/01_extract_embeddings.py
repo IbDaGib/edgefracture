@@ -25,7 +25,12 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 from PIL import Image
-import tensorflow_text
+# FIX #18: Side-effect import — tensorflow_text registers the SentencepieceOp
+# kernel that CXR Foundation's Q-Former (pax-elixr-b-text) requires at
+# tf.saved_model.load() time. Without this import, TF raises an
+# OpNotFoundError for "SentencepieceOp". The symbol is never referenced
+# directly; the import itself is what matters.
+import tensorflow_text  # noqa: F401 — registers TF ops needed by CXR Foundation
 
 # ============================================================
 # Configuration
@@ -394,6 +399,7 @@ def main():
 
         contrastive_embs = []       # (N, 4096) -- 32x128 flattened
         contrastive_single = []     # (N, 128) -- single contrastive vector
+        contrastive_valid = []      # (N,) bool -- True if extraction succeeded, False if zero-filled
         errors_contrastive = 0
 
         for i in tqdm(range(n_images), desc="Contrastive embeddings"):
@@ -403,26 +409,46 @@ def main():
                 )
                 contrastive_single.append(single)
                 contrastive_embs.append(all_flat)
+                contrastive_valid.append(True)
             except Exception as e:
                 errors_contrastive += 1
                 if errors_contrastive <= 3:
                     print(f"\n  Error on image {i}: {e}")
-                # Append zeros as placeholder to keep alignment with metadata
+                # Append zeros as placeholder to keep alignment with metadata.
+                # These zero-filled entries are flagged via contrastive_valid_mask.npy
+                # so downstream scripts can mask them out during evaluation
+                # (e.g., cosine similarity will be biased if zero vectors are included).
                 contrastive_single.append(np.zeros(128, dtype=np.float32))
                 contrastive_embs.append(np.zeros(4096, dtype=np.float32))
+                contrastive_valid.append(False)
 
         contrastive_array = np.array(contrastive_embs, dtype=np.float32)
         contrastive_single_array = np.array(contrastive_single, dtype=np.float32)
+        # Boolean mask: True = valid extraction, False = zero-filled due to error.
+        # Downstream scripts (e.g., 02_zero_shot.py) should load this mask and
+        # exclude entries where mask is False to avoid biasing cosine similarity
+        # computations with zero vectors.
+        contrastive_valid_mask = np.array(contrastive_valid, dtype=bool)
 
         np.save(args.output_dir / "contrastive_embeddings.npy", contrastive_array)
         np.save(args.output_dir / "contrastive_single_embeddings.npy", contrastive_single_array)
+        np.save(args.output_dir / "contrastive_valid_mask.npy", contrastive_valid_mask)
 
+        n_valid = int(contrastive_valid_mask.sum())
+        n_failed = int((~contrastive_valid_mask).sum())
         print(f"Contrastive (32x128): {args.output_dir / 'contrastive_embeddings.npy'}  "
               f"shape={contrastive_array.shape}")
         print(f"Contrastive (128):    {args.output_dir / 'contrastive_single_embeddings.npy'}  "
               f"shape={contrastive_single_array.shape}")
-        if errors_contrastive:
-            print(f"Errors: {errors_contrastive} (replaced with zeros)")
+        print(f"Valid mask:           {args.output_dir / 'contrastive_valid_mask.npy'}  "
+              f"shape={contrastive_valid_mask.shape}")
+        print(f"\nContrastive extraction summary:")
+        print(f"  Valid:  {n_valid}/{n_images}")
+        print(f"  Failed: {n_failed}/{n_images} (replaced with zeros, flagged in mask)")
+        if n_failed > 0:
+            print(f"  WARNING: {n_failed} extraction(s) failed and were zero-filled.")
+            print(f"  Downstream scripts should load contrastive_valid_mask.npy and")
+            print(f"  filter these entries to avoid biasing similarity computations.")
 
     print("\n" + "=" * 60)
     print("DONE")

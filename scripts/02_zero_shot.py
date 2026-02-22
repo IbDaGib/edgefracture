@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.metrics import roc_auc_score, roc_curve, classification_report
+from sklearn.model_selection import StratifiedKFold
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -481,20 +482,36 @@ def main():
         pos_embs = text_embs[prompt_name]["positive"]
         neg_embs = text_embs[prompt_name]["negative"]
 
-        # Try multiple temperature values
+        # Select temperature via cross-validation to prevent test-set leakage.
+        # Without CV, evaluating all candidate temperatures on the full dataset
+        # and picking the best one optimizes a hyperparameter directly on the
+        # test set, inflating the reported AUC. Using stratified K-fold ensures
+        # the temperature is chosen based on held-out validation performance.
+        candidate_temps = [0.01, 0.05, 0.1, 0.5, 1.0]
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        temp_cv_aucs = {temp: [] for temp in candidate_temps}
+
+        for train_idx, val_idx in skf.split(embeddings, y_true):
+            y_val = y_true[val_idx]
+            emb_val = embeddings[val_idx]
+            for temp in candidate_temps:
+                fold_scores = compute_zero_shot_scores(emb_val, pos_embs, neg_embs, temperature=temp)
+                try:
+                    fold_auc = roc_auc_score(y_val, fold_scores)
+                    temp_cv_aucs[temp].append(fold_auc)
+                except ValueError:
+                    continue
+
         best_auc = 0
         best_temp = 1.0
-        for temp in [0.01, 0.05, 0.1, 0.5, 1.0]:
-            scores = compute_zero_shot_scores(embeddings, pos_embs, neg_embs, temperature=temp)
-            try:
-                auc = roc_auc_score(y_true, scores)
-                if auc > best_auc:
-                    best_auc = auc
+        for temp in candidate_temps:
+            if temp_cv_aucs[temp]:
+                mean_auc = np.mean(temp_cv_aucs[temp])
+                if mean_auc > best_auc:
+                    best_auc = mean_auc
                     best_temp = temp
-            except ValueError:
-                continue
 
-        # Evaluate with best temperature
+        # Compute final scores on full dataset with the CV-selected temperature
         scores = compute_zero_shot_scores(embeddings, pos_embs, neg_embs, temperature=best_temp)
         print(f"  Best temperature: {best_temp}")
 

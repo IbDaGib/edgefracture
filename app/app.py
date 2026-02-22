@@ -5,11 +5,17 @@ MedGemma Impact Challenge 2026
 
 Stepped workflow: Upload → Triage → Report → Evidence
 Runs fully offline on Jetson Orin Nano ($249)
+
+Two HAI-DEF models:
+  - CXR Foundation (google/cxr-foundation) — image embeddings + fracture classification
+  - MedGemma 4B (google/medgemma-4b-it) — clinical report generation
 """
 
 import argparse
+import io
 import json
 import os
+import pickle
 import re
 import time
 from pathlib import Path
@@ -17,7 +23,7 @@ from pathlib import Path
 import gradio as gr
 import numpy as np
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -29,59 +35,238 @@ MEDGEMMA_MODEL = os.environ.get("MEDGEMMA_MODEL", "hf.co/unsloth/medgemma-4b-it-
 TRIAGE_THRESHOLDS = {"red": 0.70, "yellow": 0.40}
 BODY_REGIONS = ["Hand", "Leg", "Hip", "Shoulder", "Unknown"]
 
-LINEAR_PROBE_PATH = os.environ.get("PROBE_PATH", "")
-CXR_MODEL_PATH = os.environ.get("CXR_MODEL_PATH", "")
+LINEAR_PROBE_PATH = os.environ.get(
+    "PROBE_PATH", "results/linear_probe/fracture_probe.pkl"
+)
+REGION_CLASSIFIER_PATH = os.environ.get(
+    "REGION_PATH", "results/linear_probe/region_classifier.pkl"
+)
+CXR_MODEL_PATH = os.environ.get(
+    "CXR_MODEL_PATH", "models/cxr-foundation/elixr-c-v2-pooled"
+)
+
+IMAGE_SIZE = 1024  # CXR Foundation input size
 
 # ---------------------------------------------------------------------------
-# Classifier
+# CXR Foundation + Linear Probe Classifier
 # ---------------------------------------------------------------------------
 
 class FractureClassifier:
     """
-    Fracture classification interface.
-    Placeholder mode until CXR Foundation + linear probe are wired in.
+    Real CXR Foundation inference → linear probe classification.
+    Falls back to placeholder mode if models aren't available.
     """
 
     def __init__(self):
+        self.vision_model = None
+        self.probe = None
+        self.scaler = None
+        self.region_classifier = None
         self.model_loaded = False
         self.probe_loaded = False
+        self.region_loaded = False
+        self._tf = None
         self._try_load()
 
     def _try_load(self):
+        # --- Load linear probe ---
+        self.temperature = None
         if LINEAR_PROBE_PATH and os.path.exists(LINEAR_PROBE_PATH):
             try:
-                import pickle
                 with open(LINEAR_PROBE_PATH, "rb") as f:
-                    self.probe = pickle.load(f)
+                    data = pickle.load(f)
+                if isinstance(data, dict):
+                    self.probe = data["model"]
+                    self.scaler = data.get("scaler")
+                    self.temperature = data.get("temperature")
+                else:
+                    self.probe = data
                 self.probe_loaded = True
-                print(f"✓ Linear probe loaded from {LINEAR_PROBE_PATH}")
+                if self.temperature is not None:
+                    print(f"✓ Linear probe loaded from {LINEAR_PROBE_PATH} "
+                          f"(calibrated T={self.temperature:.4f})")
+                else:
+                    print(f"✓ Linear probe loaded from {LINEAR_PROBE_PATH}")
             except Exception as e:
                 print(f"⚠ Could not load linear probe: {e}")
 
+        # --- Load region classifier ---
+        if REGION_CLASSIFIER_PATH and os.path.exists(REGION_CLASSIFIER_PATH):
+            try:
+                with open(REGION_CLASSIFIER_PATH, "rb") as f:
+                    self.region_classifier = pickle.load(f)
+                self.region_loaded = True
+                print(f"✓ Region classifier loaded from {REGION_CLASSIFIER_PATH}")
+                print(f"  Classes: {list(self.region_classifier.classes_)}")
+            except Exception as e:
+                print(f"⚠ Could not load region classifier: {e}")
+
+        # --- Load CXR Foundation vision model ---
         if CXR_MODEL_PATH and os.path.exists(CXR_MODEL_PATH):
             try:
+                import tensorflow as tf
+                import tensorflow_text  # registers SentencepieceOp needed by CXR Foundation
+                self._tf = tf
+
+                # Suppress TF warnings for cleaner output
+                tf.get_logger().setLevel("ERROR")
+                os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+                self.vision_model = tf.saved_model.load(CXR_MODEL_PATH)
                 self.model_loaded = True
                 print(f"✓ CXR Foundation loaded from {CXR_MODEL_PATH}")
+            except ImportError:
+                print("⚠ TensorFlow not available — CXR Foundation won't load")
             except Exception as e:
                 print(f"⚠ Could not load CXR Foundation: {e}")
 
         if not self.model_loaded:
-            print("ℹ Running in PLACEHOLDER mode — classifier returns demo scores")
+            print("ℹ CXR Foundation not loaded — running in PLACEHOLDER mode")
+        if not self.probe_loaded:
+            print("ℹ Linear probe not loaded — running in PLACEHOLDER mode")
+
+    # ---- Image preprocessing (matches extraction script) ----
+
+    def _preprocess_image(self, image: Image.Image) -> bytes:
+        """Convert PIL image to serialized tf.Example (CXR Foundation input format)."""
+        tf = self._tf
+
+        img = image.convert("L")  # Grayscale
+        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS)
+
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        png_bytes = buffer.getvalue()
+
+        feature = {
+            "image/encoded": tf.train.Feature(
+                bytes_list=tf.train.BytesList(value=[png_bytes])
+            ),
+        }
+        example = tf.train.Example(
+            features=tf.train.Features(feature=feature)
+        )
+        return example.SerializeToString()
+
+    def _extract_embedding(self, serialized_example: bytes) -> np.ndarray:
+        """Extract raw embedding from CXR Foundation vision encoder."""
+        tf = self._tf
+        input_tensor = tf.constant([serialized_example])
+
+        try:
+            if (hasattr(self.vision_model, "signatures")
+                    and "serving_default" in self.vision_model.signatures):
+                serve_fn = self.vision_model.signatures["serving_default"]
+                input_keys = list(serve_fn.structured_input_signature[1].keys())
+                output = serve_fn(**{input_keys[0]: input_tensor})
+            else:
+                output = self.vision_model(input_tensor)
+        except Exception:
+            output = self.vision_model(inputs=input_tensor)
+
+        if isinstance(output, dict):
+            keys = list(output.keys())
+            emb = output[keys[0]].numpy()
+            return emb[0].flatten()
+        else:
+            return output.numpy()[0].flatten()
+
+    # ---- Input validation ----
+    # FIX #8: Basic image validation — warn (don't block) if the input
+    # doesn't look like an X-ray, to catch accidental uploads of photos, etc.
+
+    @staticmethod
+    def _validate_xray_image(image: Image.Image) -> list[str]:
+        """Check whether an image looks plausibly like an X-ray.
+
+        Returns a list of warning strings (empty if the image passes all checks).
+        This is advisory only — classification still proceeds regardless.
+        """
+        warnings = []
+
+        # 1. Check image dimensions are reasonable for an X-ray
+        #    Typical X-rays are at least a few hundred pixels in each dimension
+        #    and not absurdly small (icons) or huge (ultra-high-res photos).
+        MIN_DIM = 128
+        MAX_DIM = 10000
+        w, h = image.size
+        if w < MIN_DIM or h < MIN_DIM:
+            warnings.append(
+                f"Image is very small ({w}x{h}px). X-rays are typically "
+                f"at least {MIN_DIM}x{MIN_DIM}px."
+            )
+        if w > MAX_DIM or h > MAX_DIM:
+            warnings.append(
+                f"Image is unusually large ({w}x{h}px). This may not be "
+                "a standard X-ray image."
+            )
+
+        # 2. Check if the image is already grayscale or nearly so.
+        #    X-rays are inherently grayscale; a colorful photo is likely not one.
+        if image.mode in ("RGB", "RGBA"):
+            # Sample pixels to check color saturation
+            rgb_image = image.convert("RGB")
+            # Downsample for speed
+            small = rgb_image.resize((64, 64), Image.NEAREST)
+            arr = np.array(small, dtype=np.float32)
+            # Compute per-pixel max channel difference as a saturation proxy
+            channel_range = arr.max(axis=2) - arr.min(axis=2)  # (64, 64)
+            mean_saturation = float(channel_range.mean())
+            # Grayscale images have near-zero channel spread; colorful photos
+            # typically have mean saturation > 30.
+            SATURATION_THRESHOLD = 30.0
+            if mean_saturation > SATURATION_THRESHOLD:
+                warnings.append(
+                    f"Image appears to be a color photograph (mean channel "
+                    f"spread={mean_saturation:.1f}). X-rays are typically "
+                    "grayscale. Results may be unreliable."
+                )
+
+        # 3. Aspect ratio sanity — X-rays are rarely extremely wide or tall
+        aspect = max(w, h) / max(min(w, h), 1)
+        if aspect > 5.0:
+            warnings.append(
+                f"Unusual aspect ratio ({aspect:.1f}:1). This may not be "
+                "a standard X-ray image."
+            )
+
+        return warnings
+
+    # ---- Classification ----
 
     def classify(self, image: Image.Image, body_region: str = "Unknown") -> dict:
         start = time.time()
 
+        # Validate that input looks like an X-ray (advisory warnings only)
+        image_warnings = self._validate_xray_image(image)
+
         if self.model_loaded and self.probe_loaded:
-            prob = self._real_classify(image, body_region)
+            prob, embedding = self._real_classify(image)
             model_used = "CXR Foundation + Linear Probe"
+
+            # Auto-detect body region from the same embedding
+            if body_region == "Unknown" and self.region_loaded:
+                detected_region, region_conf = self._detect_region(embedding)
+                body_region = detected_region
+                region_auto = True
+            else:
+                region_conf = None
+                region_auto = (body_region == "Unknown")
+        elif self.probe_loaded and not self.model_loaded:
+            prob = self._placeholder_score(body_region)
+            model_used = "Placeholder (CXR Foundation not loaded)"
+            region_conf = None
+            region_auto = False
         else:
             prob = self._placeholder_score(body_region)
             model_used = "Placeholder (demo mode)"
+            region_conf = None
+            region_auto = False
 
         latency_ms = (time.time() - start) * 1000
         triage_level, triage_color = self._triage(prob)
 
-        return {
+        result = {
             "probability": round(prob, 3),
             "triage_level": triage_level,
             "triage_color": triage_color,
@@ -89,18 +274,54 @@ class FractureClassifier:
             "confidence": self._confidence_label(prob),
             "model_used": model_used,
             "latency_ms": round(latency_ms, 1),
+            "region_auto_detected": region_auto,
         }
+        if region_conf is not None:
+            result["region_confidence"] = round(region_conf, 3)
 
-    def _real_classify(self, image: Image.Image, body_region: str) -> float:
-        raise NotImplementedError("Wire up CXR Foundation inference here")
+        # Attach image validation warnings (FIX #8)
+        if image_warnings:
+            result["image_warnings"] = image_warnings
+
+        return result
+
+    def _detect_region(self, embedding: np.ndarray) -> tuple[str, float]:
+        """Predict body region from CXR Foundation embedding."""
+        embedding_2d = embedding.reshape(1, -1)
+        region = self.region_classifier.predict(embedding_2d)[0]
+        proba = self.region_classifier.predict_proba(embedding_2d)[0]
+        conf = float(proba.max())
+        # Capitalize to match BODY_REGIONS list
+        region = region.capitalize()
+        return region, conf
+
+    def _real_classify(self, image: Image.Image) -> tuple[float, np.ndarray]:
+        """Full pipeline: image → CXR Foundation embedding → linear probe → probability.
+        Returns (probability, embedding) so embedding can be reused for region detection."""
+        # Step 1: Preprocess
+        serialized = self._preprocess_image(image)
+
+        # Step 2: Extract embedding
+        embedding = self._extract_embedding(serialized)  # (88064,)
+
+        # Step 3: Linear probe prediction (with temperature calibration)
+        embedding_2d = embedding.reshape(1, -1)
+        if self.scaler is not None:
+            embedding_2d = self.scaler.transform(embedding_2d)
+        # Raw logit → temperature-scaled sigmoid for calibrated probabilities.
+        # Temperature is loaded from the pkl file (calibrated on held-out set
+        # via scipy.optimize.minimize_scalar on log-loss). Falls back to 3.49
+        # if not available in the pkl (legacy models).
+        logit = self.probe.decision_function(embedding_2d)[0]
+        temperature = self.temperature if self.temperature is not None else 3.49
+        prob = 1.0 / (1.0 + np.exp(-logit / temperature))
+
+        return float(prob), embedding
 
     def _placeholder_score(self, body_region: str) -> float:
         demo_scores = {
-            "Hand": 0.62,
-            "Leg": 0.78,
-            "Hip": 0.45,
-            "Shoulder": 0.33,
-            "Unknown": 0.55,
+            "Hand": 0.62, "Leg": 0.78, "Hip": 0.45,
+            "Shoulder": 0.33, "Unknown": 0.55,
         }
         return demo_scores.get(body_region, 0.55)
 
@@ -121,6 +342,63 @@ class FractureClassifier:
             return "moderate-high"
         else:
             return "moderate"
+
+
+# ---------------------------------------------------------------------------
+# Safety Gate — programmatic safety disclaimers
+# ---------------------------------------------------------------------------
+
+_OVERCONFIDENT_PATTERNS = [
+    r"\bdiagnos(?:is|ed|e)\b",
+    r"\bconfirm(?:s|ed)?\b",
+    r"\bdefinitely\b",
+    r"\bcertainly\b",
+    r"\bclearly shows\b",
+    r"\bI can see\b",
+    r"\bthe fracture is\b",
+    r"\bthis is a\b.*\bfracture\b",
+]
+
+SAFETY_DISCLAIMER = (
+    "\n\n---\n⚠️ **AI-assisted screening — requires clinician confirmation.** "
+    "This is a research prototype, not a diagnostic device. All findings must be "
+    "reviewed by a qualified healthcare professional."
+)
+
+
+def safety_gate(text: str) -> str:
+    """Scan MedGemma output for overconfident language and append safety disclaimer."""
+    # Always append the disclaimer
+    text = text.rstrip()
+
+    # Flag if overconfident patterns found
+    for pattern in _OVERCONFIDENT_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            text = re.sub(
+                pattern,
+                lambda m: f"*{m.group(0)}*",  # italicize overconfident terms
+                text,
+                flags=re.IGNORECASE,
+            )
+
+    if not text.endswith(SAFETY_DISCLAIMER.strip()):
+        text += SAFETY_DISCLAIMER
+
+    return text
+
+
+def append_metadata_block(text: str, result: dict) -> str:
+    """Programmatically append structured metadata — never rely on MedGemma for this."""
+    block = (
+        f"\n\n**Screening Metadata**\n"
+        f"- CXR Foundation confidence: {round(result['probability'] * 100, 1)}%\n"
+        f"- Body region: {result['body_region']}\n"
+        f"- Triage level: {result['triage_level']}\n"
+        f"- Model: CXR Foundation ELIXR-C v2 → Linear Probe\n"
+        f"- Report: MedGemma 4B (Q4_K_M)\n"
+        f"- Inference: {result['latency_ms']}ms (classification)"
+    )
+    return text + block
 
 
 # ---------------------------------------------------------------------------
@@ -162,14 +440,53 @@ Avoid medical jargon. Let them know what happens next and that a doctor \
 will review everything. Do not be alarming — be honest but calming."""
 
 
+def _sanitize_clinical_context(text: str) -> str:
+    """Sanitize user-provided clinical context before interpolation into LLM prompt.
+
+    FIX #7: Prevents prompt injection by stripping instruction-like patterns,
+    truncating to a safe length, and removing prompt-breaking characters.
+    """
+    # 1. Truncate to 500 characters max
+    text = text.strip()[:500]
+
+    # 2. Strip instruction-like patterns that could hijack the LLM prompt
+    injection_patterns = [
+        r"ignore\s+(all\s+)?previous\s+instructions",
+        r"ignore\s+(all\s+)?above",
+        r"disregard\s+(all\s+)?previous",
+        r"you\s+are\s+now",
+        r"new\s+instructions?:",
+        r"system\s*prompt",
+        r"override\s+(all\s+)?instructions",
+        r"forget\s+(all\s+)?(previous|above|prior)",
+        r"act\s+as\s+(a\s+)?",
+        r"pretend\s+(you\s+are|to\s+be)",
+        r"do\s+not\s+follow",
+        r"instead[,:]?\s+(you\s+should|do|say|write)",
+    ]
+    for pattern in injection_patterns:
+        text = re.sub(pattern, "[removed]", text, flags=re.IGNORECASE)
+
+    # 3. Remove characters that could break prompt formatting
+    #    (keep alphanumeric, basic punctuation, and medical symbols)
+    text = re.sub(r"[{}<>|\\`]", "", text)
+
+    return text.strip()
+
+
 def _build_context_section(clinical_context: str) -> str:
     if clinical_context and clinical_context.strip():
-        return f"\nClinical context provided: {clinical_context.strip()}\n"
+        sanitized = _sanitize_clinical_context(clinical_context)
+        if sanitized:
+            return f"\nClinical context provided: {sanitized}\n"
     return ""
 
 
-def generate_report(classification_result: dict, clinical_context: str = "",
-                    report_type: str = "clinical") -> dict:
+def generate_report(
+    classification_result: dict,
+    clinical_context: str = "",
+    report_type: str = "clinical",
+) -> dict:
     """Generate either clinical or patient-friendly report via MedGemma."""
     prob = classification_result["probability"]
     context_section = _build_context_section(clinical_context)
@@ -203,31 +520,54 @@ def generate_report(classification_result: dict, clinical_context: str = "",
         resp.raise_for_status()
         data = resp.json()
         report_text = _clean_medgemma_output(data.get("response", "").strip())
+
+        # Apply safety gate and metadata
+        report_text = safety_gate(report_text)
+        report_text = append_metadata_block(report_text, classification_result)
+
         latency = time.time() - start
-        return {"report_text": report_text, "latency_s": round(latency, 1), "error": None}
+        return {
+            "report_text": report_text,
+            "latency_s": round(latency, 1),
+            "error": None,
+        }
 
     except requests.ConnectionError:
-        return {"report_text": "", "latency_s": 0,
-                "error": "Cannot connect to Ollama. Start with: ollama serve"}
+        return {
+            "report_text": "",
+            "latency_s": 0,
+            "error": "Cannot connect to Ollama. Start with: ollama serve",
+        }
     except requests.Timeout:
-        return {"report_text": "", "latency_s": round(time.time() - start, 1),
-                "error": "MedGemma timed out (>120s)."}
+        return {
+            "report_text": "",
+            "latency_s": round(time.time() - start, 1),
+            "error": "MedGemma timed out (>120s).",
+        }
     except Exception as e:
-        return {"report_text": "", "latency_s": round(time.time() - start, 1),
-                "error": f"MedGemma error: {str(e)}"}
+        return {
+            "report_text": "",
+            "latency_s": round(time.time() - start, 1),
+            "error": f"MedGemma error: {str(e)}",
+        }
 
 
 def _clean_medgemma_output(text: str) -> str:
+    """Strip MedGemma artifacts: leaked prompts, critique loops, unused tokens."""
     text = re.sub(r"<unused\d+>", "", text)
     if "You are a musculoskeletal" in text or "You are a friendly" in text:
-        for marker in ["1.", "CLINICAL SUMMARY", "Clinical Summary",
-                       "The AI", "Your X-ray", "Based on"]:
+        for marker in [
+            "1.", "CLINICAL SUMMARY", "Clinical Summary",
+            "The AI", "Your X-ray", "Based on",
+        ]:
             idx = text.find(marker)
             if idx > 0:
                 text = text[idx:]
                 break
     text = re.sub(r"\*\*Critique:?\*\*.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
-    text = re.sub(r"\*\*Self-assessment:?\*\*.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+    text = re.sub(
+        r"\*\*Self-assessment:?\*\*.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL
+    )
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
@@ -259,10 +599,10 @@ def get_model_transparency_info(result: dict) -> str:
         "that capture bone and tissue structure.\n"
     )
     lines.append(
-        "**Step 2 — Fracture Screening:** The image embeddings were passed through "
-        "a fracture classifier trained on the "
+        "**Step 2 — Fracture Screening:** The image embeddings (88,064 dimensions) "
+        "were passed through a logistic regression classifier trained on the "
         "[FracAtlas](https://figshare.com/articles/dataset/The_dataset/22363012) dataset "
-        f"(4,083 musculoskeletal X-rays across hand, leg, hip, and shoulder). "
+        "(4,083 musculoskeletal X-rays across hand, leg, hip, and shoulder). "
         f"The classifier estimated a **{round(prob * 100, 1)}% probability** of fracture.\n"
     )
     lines.append(
@@ -308,42 +648,51 @@ def get_model_transparency_info(result: dict) -> str:
 
 
 def get_performance_context() -> str:
-    """Show model performance data — populated with real results after experiments."""
+    """Model performance data from actual experiments."""
     lines = []
     lines.append("### Model Performance\n")
     lines.append(
         "CXR Foundation was trained exclusively on chest X-rays, yet demonstrates "
-        "meaningful transfer to musculoskeletal fracture detection — a task it was "
+        "strong transfer to musculoskeletal fracture detection — a task it was "
         "**never designed for**.\n"
     )
-    lines.append("| Body Region | Images | Fractures | Linear Probe AUC |")
-    lines.append("|-------------|--------|-----------|-----------------|")
-    lines.append("| Hand | 1,538 | ~437 | *pending* |")
-    lines.append("| Leg | 2,272 | ~263 | *pending* |")
-    lines.append("| Hip | 338 | ~63 | *pending* |")
-    lines.append("| Shoulder | 349 | ~63 | *pending* |")
-    lines.append("| **Overall** | **4,083** | **717** | ***pending*** |")
-    lines.append(
-        "\n*Results will be populated once embedding extraction and "
-        "linear probe training are complete.*"
-    )
+    lines.append("#### Per-Region AUC (Linear Probe, 5-fold CV)\n")
+    lines.append("| Body Region | Images | Fractures | AUC |")
+    lines.append("|-------------|--------|-----------|-----|")
+    lines.append("| Hand | 1,510 | 438 | **0.850** |")
+    lines.append("| Hip | 179 | 10 | **0.864** |")
+    lines.append("| Leg | 2,237 | 259 | **0.888** |")
+    lines.append("| Shoulder | 98 | 10 | **0.848** |")
+    lines.append("| **Overall** | **4,024** | **717** | **0.882** |")
 
-    lines.append("\n### Data Efficiency\n")
+    lines.append("\n#### Data Efficiency — AUC vs. Training Examples\n")
     lines.append(
-        "A key question: how many labeled examples does it take to make a chest X-ray "
-        "model useful for fracture screening? The data efficiency curve below shows "
-        "classifier performance (AUC) as a function of training set size.\n"
+        "How many labeled X-rays does it take to make a chest X-ray model "
+        "useful for fracture screening?\n"
     )
-    lines.append("*Chart will be inserted after experiments.*")
+    lines.append("| Training Examples | AUC | Sensitivity | Specificity |")
+    lines.append("|-------------------|-----|-------------|-------------|")
+    lines.append("| 10 | 0.556 | 0.004 | 0.999 |")
+    lines.append("| 25 | 0.578 | 0.015 | 0.991 |")
+    lines.append("| 50 | 0.607 | 0.078 | 0.964 |")
+    lines.append("| 100 | 0.683 | 0.191 | 0.947 |")
+    lines.append("| 250 | 0.785 | 0.421 | 0.912 |")
+    lines.append("| 500 | 0.820 | 0.561 | 0.893 |")
+    lines.append("| **4,024 (all)** | **0.882** | **0.692** | **0.917** |")
+    lines.append(
+        "\n*With just 500 labeled examples, the system crosses the 0.80 AUC threshold "
+        "— demonstrating that pre-trained chest X-ray embeddings encode transferable "
+        "representations for musculoskeletal fracture detection.*"
+    )
 
     lines.append("\n### Edge Deployment\n")
-    lines.append("| Metric | Target | Measured |")
-    lines.append("|--------|--------|---------|")
+    lines.append("| Metric | Target | Status |")
+    lines.append("|--------|--------|--------|")
     lines.append("| Device | Jetson Orin Nano 8GB | ✓ |")
     lines.append("| Device cost | $249 | ✓ |")
-    lines.append("| CXR Foundation latency | < 3s | *pending* |")
-    lines.append("| MedGemma report latency | < 90s | *pending* |")
-    lines.append("| Total memory (both models) | < 6GB | *pending* |")
+    lines.append("| CXR Foundation latency | < 3s | *pending Jetson benchmarks* |")
+    lines.append("| MedGemma report latency | < 90s | *pending Jetson benchmarks* |")
+    lines.append("| Total memory (both models) | < 6GB | *pending Jetson benchmarks* |")
     lines.append("| Internet required | None | ✓ Fully offline |")
 
     return "\n".join(lines)
@@ -354,7 +703,7 @@ def get_performance_context() -> str:
 # ---------------------------------------------------------------------------
 
 def run_batch_triage(files, body_region):
-    """Process multiple X-rays and return a triage summary table."""
+    """Process multiple X-rays and return a prioritized triage summary table."""
     if not files:
         return "Upload one or more X-ray images to run batch triage."
 
@@ -365,7 +714,9 @@ def run_batch_triage(files, body_region):
         try:
             img = Image.open(filepath)
             result = classifier.classify(img, body_region)
-            color_emoji = {"red": "🔴", "yellow": "🟡", "green": "🟢"}[result["triage_color"]]
+            color_emoji = {"red": "🔴", "yellow": "🟡", "green": "🟢"}[
+                result["triage_color"]
+            ]
             rows.append({
                 "": color_emoji,
                 "File": filename,
@@ -384,7 +735,15 @@ def run_batch_triage(files, body_region):
                 "Latency": "-",
             })
 
-    rows.sort(key=lambda r: r["Fracture %"], reverse=True)
+    # FIX #1: Sort numerically, not lexicographically. String sort would rank
+    # "9.1%" above "78.5%" because "9" > "7" in ASCII — dangerous for triage.
+    # Errors (non-numeric values) sort to the end with -1 sentinel.
+    rows.sort(
+        key=lambda r: float(r["Fracture %"].rstrip("%"))
+        if r["Fracture %"] not in ("Error", "-")
+        else -1,
+        reverse=True,
+    )
 
     if not rows:
         return "No images processed."
@@ -429,17 +788,16 @@ def check_ollama_status():
 
 
 def step_triage(image, body_region, clinical_context):
-    """Step 1 → Step 2: Run triage."""
+    """Step 1 → Step 2: Run triage classification."""
     if image is None:
         return (
-            gr.update(visible=False),
-            "",
-            "",
-            gr.update(visible=False),
-            None,
+            gr.update(visible=False), "", "",
+            gr.update(visible=False), None,
         )
 
-    pil_image = Image.fromarray(image) if not isinstance(image, Image.Image) else image
+    pil_image = (
+        Image.fromarray(image) if not isinstance(image, Image.Image) else image
+    )
     result = classifier.classify(pil_image, body_region)
 
     state = {
@@ -538,29 +896,39 @@ def _make_reasoning_text(result: dict) -> str:
     latency = result["latency_ms"]
 
     lines = []
-    lines.append(f"**Classification:** {'Fracture detected' if prob >= 0.5 else 'No fracture detected'}")
+    lines.append(
+        f"**Classification:** "
+        f"{'Fracture detected' if prob >= 0.5 else 'No fracture detected'}"
+    )
     lines.append(f"**Confidence:** {result['confidence']}")
-    lines.append(f"**Body region:** {region}")
+    if result.get("region_auto_detected") and result.get("region_confidence"):
+        lines.append(
+            f"**Body region:** {region} "
+            f"*(auto-detected, {round(result['region_confidence'] * 100, 1)}% confidence)*"
+        )
+    else:
+        lines.append(f"**Body region:** {region}")
     lines.append(f"**Model:** {model}")
     lines.append(f"**Latency:** {latency}ms")
     lines.append("")
 
     if prob >= 0.70:
         lines.append(
-            f"⚡ The model detected strong fracture-like patterns in this {region.lower()} X-ray. "
-            "This case should be **prioritized** for radiologist review."
+            f"⚡ The model detected strong fracture-like patterns in this "
+            f"{region.lower()} X-ray. This case should be **prioritized** "
+            "for radiologist review."
         )
     elif prob >= 0.40:
         lines.append(
-            f"The model detected some features consistent with fracture patterns in the "
-            f"{region.lower()}, but with moderate uncertainty. Additional imaging or clinical "
-            "correlation is recommended."
+            f"The model detected some features consistent with fracture patterns "
+            f"in the {region.lower()}, but with moderate uncertainty. Additional "
+            "imaging or clinical correlation is recommended."
         )
     else:
         lines.append(
-            f"The model did not detect strong fracture patterns in this {region.lower()} X-ray. "
-            "However, subtle or non-displaced fractures can be missed. Clinical judgment should "
-            "always take precedence."
+            f"The model did not detect strong fracture patterns in this "
+            f"{region.lower()} X-ray. However, subtle or non-displaced fractures "
+            "can be missed. Clinical judgment should always take precedence."
         )
 
     return "\n\n".join(lines)
@@ -608,16 +976,13 @@ def build_ui():
                 with gr.Row():
                     with gr.Column(scale=1):
                         image_input = gr.Image(
-                            label="X-ray Image",
-                            type="pil",
-                            height=350,
+                            label="X-ray Image", type="pil", height=350,
                         )
                     with gr.Column(scale=1):
                         body_region = gr.Dropdown(
-                            choices=BODY_REGIONS,
-                            value="Unknown",
+                            choices=BODY_REGIONS, value="Unknown",
                             label="Body Region",
-                            info="Select the body region shown in the X-ray",
+                            info="Leave as 'Unknown' to auto-detect, or select manually to override",
                         )
                         clinical_context = gr.Textbox(
                             label="Clinical Context (optional)",
@@ -628,7 +993,7 @@ def build_ui():
                             lines=3,
                         )
                         triage_btn = gr.Button(
-                            "🔍 Analyze X-ray", variant="primary", size="lg"
+                            "🔍 Analyze X-ray", variant="primary", size="lg",
                         )
 
                 # ── STEP 2: Triage Result ──
@@ -648,15 +1013,16 @@ def build_ui():
                     gr.Markdown("---")
                     gr.Markdown("#### Step 3 — AI Clinical Report")
                     gr.Markdown(
-                        "*MedGemma generates separate reports for clinicians and patients. "
-                        "Clinical context (if provided above) is included in the prompt.*"
+                        "*MedGemma generates separate reports for clinicians "
+                        "and patients. Clinical context (if provided above) is "
+                        "included in the prompt.*"
                     )
                     with gr.Row():
                         clinical_btn = gr.Button(
-                            "🩺 Generate Clinician Report", variant="primary"
+                            "🩺 Generate Clinician Report", variant="primary",
                         )
                         patient_btn = gr.Button(
-                            "💬 Generate Patient Explanation", variant="secondary"
+                            "💬 Generate Patient Explanation", variant="secondary",
                         )
 
                     with gr.Tabs():
@@ -672,10 +1038,10 @@ def build_ui():
                 # ── STEP 4: Evidence & Transparency ──
                 gr.Markdown("---")
                 with gr.Accordion(
-                    "📊 Evidence & Transparency — How It Works", open=False
+                    "📊 Evidence & Transparency — How It Works", open=False,
                 ):
                     evidence_btn = gr.Button(
-                        "Load Evidence Panel", variant="secondary", size="sm"
+                        "Load Evidence Panel", variant="secondary", size="sm",
                     )
                     with gr.Tabs():
                         with gr.Tab("🔬 This Result"):
@@ -686,7 +1052,7 @@ def build_ui():
                         with gr.Tab("📈 Model Performance"):
                             evidence_perf_md = gr.Markdown(
                                 "*Click 'Load Evidence Panel' to see "
-                                "model benchmarks and edge deployment metrics.*"
+                                "model benchmarks and data efficiency results.*"
                             )
 
                 # ── Disclaimer ──
@@ -707,9 +1073,10 @@ def build_ui():
                 gr.Markdown(
                     """
                     #### Batch Triage Queue
-                    Upload multiple X-ray images to get a prioritized triage summary.
-                    Cases are **sorted by risk score** (highest first) — simulating a
-                    real ED workflow where the most urgent cases surface to the top.
+                    Upload multiple X-ray images to get a prioritized triage
+                    summary. Cases are **sorted by risk score** (highest first)
+                    — simulating a real ED workflow where the most urgent cases
+                    surface to the top.
                     """
                 )
                 with gr.Row():
@@ -719,12 +1086,11 @@ def build_ui():
                         file_types=["image"],
                     )
                     batch_region = gr.Dropdown(
-                        choices=BODY_REGIONS,
-                        value="Unknown",
+                        choices=BODY_REGIONS, value="Unknown",
                         label="Body Region (applied to all)",
                     )
                 batch_btn = gr.Button(
-                    "🔍 Run Batch Triage", variant="primary", size="lg"
+                    "🔍 Run Batch Triage", variant="primary", size="lg",
                 )
                 batch_results = gr.Markdown(
                     "*Upload images and click Run Batch Triage.*"
@@ -756,9 +1122,13 @@ def build_ui():
                             [CXR Foundation](https://huggingface.co/google/cxr-foundation),
                             trained only on chest X-rays, transfers to musculoskeletal
                             fracture detection across 4 body regions — with as few as
-                            50 labeled examples.
+                            500 labeled examples reaching 0.82 AUC.
                             [MedGemma 4B](https://huggingface.co/google/medgemma-4b-it)
                             provides clinical reasoning and patient communication.
+
+                            **Key Result:** Overall AUC **0.882** across hand, leg,
+                            hip, and shoulder — from a model that has never seen a
+                            musculoskeletal X-ray during training.
 
                             ---
 
@@ -790,8 +1160,9 @@ def build_ui():
                             ### Configuration
                             - **Ollama URL:** `{OLLAMA_BASE_URL}`
                             - **MedGemma:** `{MEDGEMMA_MODEL}`
-                            - **CXR Foundation:** `{'Loaded ✓' if classifier.model_loaded else 'Placeholder mode'}`
-                            - **Linear probe:** `{'Loaded ✓' if classifier.probe_loaded else 'Placeholder mode'}`
+                            - **CXR Foundation:** `{'Loaded ✓' if classifier.model_loaded else 'Not loaded — placeholder mode'}`
+                            - **Linear probe:** `{'Loaded ✓ (0.882 AUC)' if classifier.probe_loaded else 'Not loaded — placeholder mode'}`
+                            - **Region classifier:** `{'Loaded ✓ — auto-detects body region' if classifier.region_loaded else 'Not loaded — manual selection'}`
                             """
                         )
 
@@ -800,8 +1171,10 @@ def build_ui():
         triage_btn.click(
             fn=step_triage,
             inputs=[image_input, body_region, clinical_context],
-            outputs=[step2_container, triage_card, reasoning_text,
-                     step3_container, triage_state],
+            outputs=[
+                step2_container, triage_card, reasoning_text,
+                step3_container, triage_state,
+            ],
         )
 
         clinical_btn.click(
@@ -853,8 +1226,12 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"  Ollama:       {OLLAMA_BASE_URL}")
     print(f"  MedGemma:     {MEDGEMMA_MODEL}")
-    print(f"  CXR Model:    {CXR_MODEL_PATH or 'Placeholder mode'}")
-    print(f"  Linear Probe: {LINEAR_PROBE_PATH or 'Placeholder mode'}")
+    print(f"  CXR Model:    {CXR_MODEL_PATH or 'Not configured'}")
+    print(f"  Linear Probe: {LINEAR_PROBE_PATH or 'Not configured'}")
+    print(f"  Region Model: {REGION_CLASSIFIER_PATH or 'Not configured'}")
+    print(f"  CXR loaded:   {'✓' if classifier.model_loaded else '✗ (placeholder mode)'}")
+    print(f"  Probe loaded: {'✓' if classifier.probe_loaded else '✗ (placeholder mode)'}")
+    print(f"  Region loaded:{'✓ (auto-detect)' if classifier.region_loaded else '✗ (manual select)'}")
     print("=" * 60)
 
     app = build_ui()

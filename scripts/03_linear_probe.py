@@ -27,12 +27,14 @@ from pathlib import Path
 from collections import defaultdict
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import (
     roc_auc_score, roc_curve, classification_report,
     precision_recall_curve, average_precision_score,
+    log_loss,
 )
 from sklearn.preprocessing import StandardScaler
+from scipy.optimize import minimize_scalar
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -366,26 +368,112 @@ def plot_combined_summary(efficiency_results: list, region_results: dict, output
 # Save Best Model for Deployment
 # ============================================================
 
+def _calibrate_temperature(logits, y_true):
+    """Find the temperature T that minimizes log-loss on held-out data.
+
+    Temperature scaling: p = sigmoid(logit / T).
+    A higher T softens probabilities toward 0.5 (less confident).
+    """
+    def neg_log_loss(T):
+        probs = 1.0 / (1.0 + np.exp(-logits / T))
+        probs = np.clip(probs, 1e-7, 1 - 1e-7)
+        return log_loss(y_true, probs)
+
+    result = minimize_scalar(neg_log_loss, bounds=(0.1, 20.0), method="bounded")
+    return result.x
+
+
 def save_deployment_model(X, y, output_dir: Path):
-    """Train final model on ALL data and save for Jetson deployment."""
+    """Train deployment model on 80% of data, evaluate on 20% held-out set.
+
+    The held-out set is used to:
+      1. Validate the actual deployed model (separate from CV metrics).
+      2. Calibrate the temperature parameter for probability scaling.
+
+    Saves model, scaler, calibrated temperature, and held-out metrics to pkl.
+    """
     import pickle
-    
+
+    # --- Hold out 20% for final evaluation (stratified) ---
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, stratify=y, random_state=RANDOM_SEED,
+    )
+    print(f"\n  Deployment split: {len(y_train)} train / {len(y_test)} held-out test")
+    print(f"    Train: {y_train.sum()} fractures, {(1-y_train).sum()} normal")
+    print(f"    Test:  {y_test.sum()} fractures, {(1-y_test).sum()} normal")
+
+    # --- Train on the training portion only ---
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
     clf = LogisticRegression(
         C=1.0, max_iter=1000, solver="lbfgs",
         class_weight="balanced", random_state=RANDOM_SEED,
     )
-    clf.fit(X_scaled, y)
-    
+    clf.fit(X_train_s, y_train)
+
+    # --- Evaluate on held-out test set ---
+    y_score = clf.predict_proba(X_test_s)[:, 1]
+    y_pred = clf.predict(X_test_s)
+
+    holdout_auc = roc_auc_score(y_test, y_score)
+    holdout_ap = average_precision_score(y_test, y_score)
+    holdout_report = classification_report(
+        y_test, y_pred,
+        target_names=["Normal", "Fracture"],
+        output_dict=True,
+        zero_division=0,
+    )
+
+    holdout_metrics = {
+        "auc": holdout_auc,
+        "average_precision": holdout_ap,
+        "sensitivity": holdout_report["Fracture"]["recall"],
+        "specificity": holdout_report["Normal"]["recall"],
+        "precision": holdout_report["Fracture"]["precision"],
+        "f1": holdout_report["Fracture"]["f1-score"],
+        "n_train": len(y_train),
+        "n_test": len(y_test),
+    }
+
+    # --- Calibrate temperature on held-out set ---
+    logits = clf.decision_function(X_test_s)
+    temperature = float(_calibrate_temperature(logits, y_test))
+
+    # Compute calibrated log-loss for reporting
+    calibrated_probs = 1.0 / (1.0 + np.exp(-logits / temperature))
+    uncalibrated_ll = log_loss(y_test, np.clip(y_score, 1e-7, 1 - 1e-7))
+    calibrated_ll = log_loss(y_test, np.clip(calibrated_probs, 1e-7, 1 - 1e-7))
+
+    # --- Save everything ---
     model_path = output_dir / "fracture_probe.pkl"
     with open(model_path, "wb") as f:
-        pickle.dump({"model": clf, "scaler": scaler}, f)
-    
-    print(f"\nDeployment model saved: {model_path}")
+        pickle.dump({
+            "model": clf,
+            "scaler": scaler,
+            "temperature": temperature,
+            "holdout_metrics": holdout_metrics,
+        }, f)
+
+    # --- Print results, clearly distinguishing CV vs held-out ---
+    print(f"\n  Deployment model saved: {model_path}")
     print(f"  Model size: {model_path.stat().st_size / 1024:.1f} KB")
-    
+    print(f"\n  NOTE: The cross-validation metrics above (e.g. AUC=0.882) were")
+    print(f"  computed on separate CV folds of the full dataset. The metrics")
+    print(f"  below are from the HELD-OUT test set for the actual deployed model.")
+    print(f"\n  --- Held-out evaluation (deployment model) ---")
+    print(f"    AUC:               {holdout_auc:.4f}")
+    print(f"    Average Precision:  {holdout_ap:.4f}")
+    print(f"    Sensitivity:        {holdout_metrics['sensitivity']:.4f}")
+    print(f"    Specificity:        {holdout_metrics['specificity']:.4f}")
+    print(f"    Precision:          {holdout_metrics['precision']:.4f}")
+    print(f"    F1:                 {holdout_metrics['f1']:.4f}")
+    print(f"\n  --- Temperature calibration ---")
+    print(f"    Optimal temperature:  {temperature:.4f}")
+    print(f"    Log-loss (uncalib.):   {uncalibrated_ll:.4f}")
+    print(f"    Log-loss (calibrated): {calibrated_ll:.4f}")
+
     return clf, scaler
 
 

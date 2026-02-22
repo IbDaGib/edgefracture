@@ -1,12 +1,25 @@
 """
 EdgeFracture — Real Classifier Integration
 
-Drop-in replacement for the placeholder classifier in app.py.
-Use this once you have:
-  1. CXR Foundation model (TF SavedModel or converted weights)
-  2. Trained linear probe (fracture_probe.pkl from experiment 3)
+DEPRECATED / TEMPLATE ONLY (FIX #17)
+=====================================
+This file is a historical reference template. The active, fully functional
+implementation lives in ``app.py`` as ``FractureClassifier``, which already
+handles CXR Foundation loading, embedding extraction, linear probe
+classification, and region detection in a single unified class.
 
-Usage:
+Do NOT use this file in production. It is kept in the repository as a
+reference for alternative integration patterns (e.g., PyTorch conversion,
+pre-computed embeddings). The ``_extract_embedding`` method is intentionally
+left unimplemented — see ``app.py:FractureClassifier._extract_embedding``
+for the working version.
+
+Original description:
+    Drop-in replacement for the placeholder classifier in app.py.
+    Use this once you have:
+      1. CXR Foundation model (TF SavedModel or converted weights)
+      2. Trained linear probe (fracture_probe.pkl from experiment 3)
+
     # In app.py, replace:
     #   classifier = FractureClassifier()
     # with:
@@ -113,9 +126,15 @@ class RealFractureClassifier:
         # embedding = embedding.flatten()  # → (88064,)
         # return embedding
 
+        # DEPRECATED: This method is intentionally unimplemented in this
+        # template file. The working extraction pipeline lives in
+        # app.py:FractureClassifier._preprocess_image() and
+        # app.py:FractureClassifier._extract_embedding().
         raise NotImplementedError(
-            "Uncomment the TF or PyTorch extraction code above, "
-            "matching whichever format your linear probe was trained on."
+            "This file is a template/reference only. The active implementation "
+            "is app.py:FractureClassifier. If adapting this template, uncomment "
+            "the TF or PyTorch extraction code above, matching whichever format "
+            "your linear probe was trained on."
         )
 
     @staticmethod
