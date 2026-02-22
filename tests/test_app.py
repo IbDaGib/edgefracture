@@ -19,6 +19,10 @@ from app.app import (
     SAFETY_DISCLAIMER,
     _sanitize_clinical_context,
     _build_context_section,
+    _parse_json_response,
+    _render_structured_clinical,
+    _render_structured_patient,
+    _format_report_output,
     TRIAGE_THRESHOLDS,
 )
 
@@ -448,3 +452,144 @@ class TestBuildContextSection:
         # Plus the wrapper text "Clinical context provided: ...\n"
         # Total should be well under 600
         assert len(result) < 600
+
+
+# ---------------------------------------------------------------------------
+# 10. Structured JSON output
+# ---------------------------------------------------------------------------
+
+class TestParseJsonResponse:
+    """Verify _parse_json_response handles various MedGemma output formats."""
+
+    def test_clean_json(self):
+        raw = '{"primary_finding": "Possible fracture", "urgency": "MODERATE"}'
+        result = _parse_json_response(raw)
+        assert result is not None
+        assert result["primary_finding"] == "Possible fracture"
+        assert result["urgency"] == "MODERATE"
+
+    def test_json_with_code_fences(self):
+        raw = '```json\n{"summary": "Your X-ray looks normal"}\n```'
+        result = _parse_json_response(raw)
+        assert result is not None
+        assert result["summary"] == "Your X-ray looks normal"
+
+    def test_json_with_bare_fences(self):
+        raw = '```\n{"urgency": "LOW"}\n```'
+        result = _parse_json_response(raw)
+        assert result is not None
+        assert result["urgency"] == "LOW"
+
+    def test_json_embedded_in_text(self):
+        raw = 'Here is the result: {"primary_finding": "No fracture"} as requested.'
+        result = _parse_json_response(raw)
+        assert result is not None
+        assert result["primary_finding"] == "No fracture"
+
+    def test_invalid_json_returns_none(self):
+        raw = "This is just plain text with no JSON at all."
+        assert _parse_json_response(raw) is None
+
+    def test_empty_string_returns_none(self):
+        assert _parse_json_response("") is None
+
+    def test_partial_json_returns_none(self):
+        raw = '{"primary_finding": "incomplete'
+        assert _parse_json_response(raw) is None
+
+    def test_whitespace_around_json(self):
+        raw = '  \n  {"urgency": "URGENT"}  \n  '
+        result = _parse_json_response(raw)
+        assert result is not None
+        assert result["urgency"] == "URGENT"
+
+
+class TestRenderStructuredClinical:
+    """Verify clinical JSON renders into readable markdown."""
+
+    def test_full_fields(self):
+        parsed = {
+            "primary_finding": "Suspected distal radius fracture",
+            "urgency": "URGENT",
+            "recommendation": "Splint and refer to orthopedics",
+            "differential": "Colles fracture, Smith fracture",
+            "clinical_note": "Check for scaphoid tenderness",
+        }
+        result = _render_structured_clinical(parsed)
+        assert "Suspected distal radius fracture" in result
+        assert "🔴 URGENT" in result
+        assert "Splint and refer" in result
+        assert "Colles fracture" in result
+        assert "scaphoid tenderness" in result
+
+    def test_urgency_icons(self):
+        for level, icon in [("URGENT", "🔴"), ("MODERATE", "🟡"), ("LOW", "🟢")]:
+            parsed = {"urgency": level}
+            result = _render_structured_clinical(parsed)
+            assert icon in result
+
+    def test_partial_fields(self):
+        parsed = {"primary_finding": "Low suspicion"}
+        result = _render_structured_clinical(parsed)
+        assert "Low suspicion" in result
+        assert "Urgency" not in result  # missing field not rendered
+
+    def test_empty_dict(self):
+        assert _render_structured_clinical({}) == ""
+
+
+class TestRenderStructuredPatient:
+    """Verify patient JSON renders into friendly markdown."""
+
+    def test_full_fields(self):
+        parsed = {
+            "summary": "Your X-ray looks normal.",
+            "next_steps": "A doctor will review your results.",
+            "reassurance": "This is a routine screening.",
+        }
+        result = _render_structured_patient(parsed)
+        assert "Your X-ray looks normal." in result
+        assert "doctor will review" in result
+        assert "routine screening" in result
+
+    def test_empty_dict(self):
+        assert _render_structured_patient({}) == ""
+
+
+class TestFormatReportOutput:
+    """Verify _format_report_output structures narrative + JSON correctly."""
+
+    def test_error_report(self):
+        report = {
+            "report_text": "",
+            "structured_json": None,
+            "latency_s": 0,
+            "error": "Cannot connect to Ollama.",
+        }
+        narrative, raw_json = _format_report_output(report)
+        assert "⚠️" in narrative
+        assert raw_json == ""
+
+    def test_structured_success(self):
+        report = {
+            "report_text": "Some narrative text.",
+            "structured_json": {"urgency": "LOW"},
+            "latency_s": 2.5,
+            "error": None,
+        }
+        narrative, raw_json = _format_report_output(report)
+        assert "Some narrative text." in narrative
+        assert "MedGemma 4B" in narrative
+        assert "```json" in raw_json
+        assert '"urgency": "LOW"' in raw_json
+
+    def test_fallback_no_structured(self):
+        report = {
+            "report_text": "Fallback narrative.",
+            "structured_json": None,
+            "latency_s": 3.1,
+            "error": None,
+        }
+        narrative, raw_json = _format_report_output(report)
+        assert "Fallback narrative." in narrative
+        assert "unavailable" in raw_json.lower()

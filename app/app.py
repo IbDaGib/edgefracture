@@ -575,6 +575,44 @@ Avoid medical jargon. Let them know what happens next and that a doctor \
 will review everything. Do not be alarming — be honest but calming."""
 
 
+# -- Structured JSON prompts ------------------------------------------------
+
+CLINICAL_JSON_PROMPT = """\
+You are a musculoskeletal radiology assistant. An AI screening system \
+has analyzed a {body_region} X-ray and produced the following results:
+
+- Fracture probability: {score_pct}% ({triage_level})
+- Classification: {classification}
+- Confidence: {confidence}
+{clinical_context_section}
+Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) using this exact schema:
+
+{{"primary_finding": "1-2 sentence clinical summary of what the screening suggests",\
+ "urgency": "URGENT | MODERATE | LOW",\
+ "recommendation": "Recommended next steps (imaging, referral, follow-up)",\
+ "differential": "Possible fracture types for this body region",\
+ "clinical_note": "Any additional clinical considerations"}}"""
+
+PATIENT_JSON_PROMPT = """\
+You are a friendly medical assistant explaining an X-ray screening result \
+to a patient. The AI screening found:
+
+- Body part: {body_region}
+- Result: {classification} ({score_pct}% probability)
+- Urgency: {triage_level}
+{clinical_context_section}
+Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) using this exact schema:
+
+{{"summary": "2-3 sentence plain-language explanation of the result",\
+ "next_steps": "What happens next, in simple terms",\
+ "reassurance": "A brief reassuring statement about the process"}}"""
+
+STRUCTURED_JSON_FIELDS_CLINICAL = [
+    "primary_finding", "urgency", "recommendation", "differential", "clinical_note",
+]
+STRUCTURED_JSON_FIELDS_PATIENT = ["summary", "next_steps", "reassurance"]
+
+
 def _sanitize_clinical_context(text: str) -> str:
     """Sanitize user-provided clinical context before interpolation into LLM prompt.
 
@@ -617,17 +655,103 @@ def _build_context_section(clinical_context: str) -> str:
     return ""
 
 
+def _parse_json_response(raw: str) -> dict | None:
+    """Try to extract a JSON object from MedGemma's response.
+
+    Handles common LLM quirks: markdown code fences, trailing text, etc.
+    Returns the parsed dict or None if parsing fails.
+    """
+    text = raw.strip()
+    # Strip markdown code fences if present
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    # Try the whole string first
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Try to find a JSON object within the text
+    match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+
+def _render_structured_clinical(parsed: dict) -> str:
+    """Render parsed clinical JSON into a readable markdown report."""
+    lines = []
+    if parsed.get("primary_finding"):
+        lines.append(f"**Finding:** {parsed['primary_finding']}")
+    if parsed.get("urgency"):
+        urgency = parsed["urgency"].upper()
+        icon = {"URGENT": "🔴", "MODERATE": "🟡", "LOW": "🟢"}.get(urgency, "⚪")
+        lines.append(f"**Urgency:** {icon} {urgency}")
+    if parsed.get("differential"):
+        lines.append(f"**Differential:** {parsed['differential']}")
+    if parsed.get("recommendation"):
+        lines.append(f"**Recommendation:** {parsed['recommendation']}")
+    if parsed.get("clinical_note"):
+        lines.append(f"**Note:** {parsed['clinical_note']}")
+    return "\n\n".join(lines)
+
+
+def _render_structured_patient(parsed: dict) -> str:
+    """Render parsed patient JSON into a friendly markdown explanation."""
+    lines = []
+    if parsed.get("summary"):
+        lines.append(parsed["summary"])
+    if parsed.get("next_steps"):
+        lines.append(f"**What happens next:** {parsed['next_steps']}")
+    if parsed.get("reassurance"):
+        lines.append(f"*{parsed['reassurance']}*")
+    return "\n\n".join(lines)
+
+
+def _call_medgemma(prompt: str) -> dict:
+    """Send a prompt to MedGemma via Ollama and return the raw API response dict.
+
+    Raises requests.ConnectionError, requests.Timeout, or other exceptions
+    on failure — callers handle these.
+    """
+    resp = requests.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={
+            "model": MEDGEMMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.3,
+                "num_predict": 512,
+                "top_p": 0.9,
+            },
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def generate_report(
     classification_result: dict,
     clinical_context: str = "",
     report_type: str = "clinical",
 ) -> dict:
-    """Generate either clinical or patient-friendly report via MedGemma."""
+    """Generate a structured + narrative report via MedGemma.
+
+    Tries structured JSON output first. On parse failure, falls back to
+    the narrative prompt. The returned dict always includes:
+      - report_text: markdown narrative (safety-gated + metadata)
+      - structured_json: parsed dict or None
+      - latency_s: total wall-clock seconds
+      - error: error string or None
+    """
     prob = classification_result["probability"]
     context_section = _build_context_section(clinical_context)
 
-    template = CLINICAL_PROMPT if report_type == "clinical" else PATIENT_PROMPT
-    prompt = template.format(
+    fmt_kwargs = dict(
         body_region=classification_result["body_region"],
         score_pct=round(prob * 100, 1),
         triage_level=classification_result["triage_level"],
@@ -636,33 +760,35 @@ def generate_report(
         clinical_context_section=context_section,
     )
 
+    json_template = CLINICAL_JSON_PROMPT if report_type == "clinical" else PATIENT_JSON_PROMPT
+    narrative_template = CLINICAL_PROMPT if report_type == "clinical" else PATIENT_PROMPT
+    render_fn = _render_structured_clinical if report_type == "clinical" else _render_structured_patient
+
     start = time.time()
     try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={
-                "model": MEDGEMMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.3,
-                    "num_predict": 512,
-                    "top_p": 0.9,
-                },
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        report_text = _clean_medgemma_output(data.get("response", "").strip())
+        # --- Attempt 1: structured JSON ---
+        json_prompt = json_template.format(**fmt_kwargs)
+        data = _call_medgemma(json_prompt)
+        raw_response = data.get("response", "").strip()
+        parsed = _parse_json_response(raw_response)
 
-        # Apply safety gate and metadata
+        if parsed is not None:
+            # Structured output succeeded — render into narrative
+            report_text = render_fn(parsed)
+        else:
+            # JSON parse failed — fall back to narrative prompt
+            narrative_prompt = narrative_template.format(**fmt_kwargs)
+            data = _call_medgemma(narrative_prompt)
+            report_text = _clean_medgemma_output(data.get("response", "").strip())
+
+        # Apply safety gate and metadata to the narrative
         report_text = safety_gate(report_text)
         report_text = append_metadata_block(report_text, classification_result)
 
         latency = time.time() - start
         return {
             "report_text": report_text,
+            "structured_json": parsed,
             "latency_s": round(latency, 1),
             "error": None,
         }
@@ -670,18 +796,21 @@ def generate_report(
     except requests.ConnectionError:
         return {
             "report_text": "",
+            "structured_json": None,
             "latency_s": 0,
             "error": "Cannot connect to Ollama. Start with: ollama serve",
         }
     except requests.Timeout:
         return {
             "report_text": "",
+            "structured_json": None,
             "latency_s": round(time.time() - start, 1),
             "error": "MedGemma timed out (>120s).",
         }
     except Exception as e:
         return {
             "report_text": "",
+            "structured_json": None,
             "latency_s": round(time.time() - start, 1),
             "error": f"MedGemma error: {str(e)}",
         }
@@ -984,36 +1113,51 @@ def step_triage(image, body_region, clinical_context):
     )
 
 
+def _format_report_output(report: dict) -> tuple[str, str]:
+    """Format a report dict into (narrative_markdown, raw_json_block).
+
+    Returns a 2-tuple so the UI can render the narrative prominently and
+    the raw JSON in a collapsible accordion.
+    """
+    if report["error"]:
+        return f"⚠️ {report['error']}", ""
+
+    narrative = report["report_text"] + (
+        f"\n\n---\n*Generated by MedGemma 4B in {report['latency_s']}s*"
+    )
+
+    if report.get("structured_json"):
+        raw_json = (
+            "```json\n"
+            + json.dumps(report["structured_json"], indent=2)
+            + "\n```"
+        )
+    else:
+        raw_json = "*Structured output unavailable — narrative fallback used.*"
+
+    return narrative, raw_json
+
+
 def step_clinical_report(state):
     """Generate clinician-facing report."""
     if not state or "result" not in state:
-        return "*Run triage first.*"
+        return "*Run triage first.*", ""
 
     report = generate_report(
         state["result"], state.get("clinical_context", ""), report_type="clinical"
     )
-    if report["error"]:
-        return f"⚠️ {report['error']}"
-
-    return report["report_text"] + (
-        f"\n\n---\n*Generated by MedGemma 4B in {report['latency_s']}s*"
-    )
+    return _format_report_output(report)
 
 
 def step_patient_report(state):
     """Generate patient-friendly report."""
     if not state or "result" not in state:
-        return "*Run triage first.*"
+        return "*Run triage first.*", ""
 
     report = generate_report(
         state["result"], state.get("clinical_context", ""), report_type="patient"
     )
-    if report["error"]:
-        return f"⚠️ {report['error']}"
-
-    return report["report_text"] + (
-        f"\n\n---\n*Generated by MedGemma 4B in {report['latency_s']}s*"
-    )
+    return _format_report_output(report)
 
 
 def step_show_evidence(state):
@@ -1195,10 +1339,18 @@ def build_ui():
                             clinical_report_md = gr.Markdown(
                                 "*Click 'Generate Clinician Report' above.*"
                             )
+                            with gr.Accordion(
+                                "📦 Structured JSON (machine-readable)", open=False,
+                            ):
+                                clinical_json_md = gr.Markdown("")
                         with gr.Tab("💬 Patient View"):
                             patient_report_md = gr.Markdown(
                                 "*Click 'Generate Patient Explanation' above.*"
                             )
+                            with gr.Accordion(
+                                "📦 Structured JSON (machine-readable)", open=False,
+                            ):
+                                patient_json_md = gr.Markdown("")
 
                 # ── STEP 4: Evidence & Transparency ──
                 gr.Markdown("---")
@@ -1345,13 +1497,13 @@ def build_ui():
         clinical_btn.click(
             fn=step_clinical_report,
             inputs=[triage_state],
-            outputs=[clinical_report_md],
+            outputs=[clinical_report_md, clinical_json_md],
         )
 
         patient_btn.click(
             fn=step_patient_report,
             inputs=[triage_state],
-            outputs=[patient_report_md],
+            outputs=[patient_report_md, patient_json_md],
         )
 
         evidence_btn.click(
