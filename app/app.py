@@ -12,435 +12,63 @@ Two HAI-DEF models:
 """
 
 import argparse
-import hashlib
 import io
 import json
-import logging
-import os
-import pickle
 import re
 import threading
 import time
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import gradio as gr
-import joblib
-import numpy as np
 import requests
 from PIL import Image
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-MEDGEMMA_MODEL = os.environ.get("MEDGEMMA_MODEL", "hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M")
-
-SAFETY_AUDIT_ENABLED = os.environ.get("SAFETY_AUDIT_ENABLED", "true").lower() == "true"
-SAFETY_AUDIT_TIMEOUT = int(os.environ.get("SAFETY_AUDIT_TIMEOUT", "180"))
-
-TRIAGE_THRESHOLDS = {"red": 0.70, "yellow": 0.40}
-VALIDATED_REGIONS = {"Hand", "Leg", "Hip", "Shoulder"}
-CXR_SOFT_LOCK_MARGIN = float(os.environ.get("CXR_SOFT_LOCK_MARGIN", "0.05"))
-
-LINEAR_PROBE_PATH = os.environ.get(
-    "PROBE_PATH", "results/linear_probe/fracture_probe.joblib"
-)
-CXR_MODEL_PATH = os.environ.get(
-    "CXR_MODEL_PATH", "models/cxr-foundation/elixr-c-v2-pooled"
-)
-
-IMAGE_SIZE = 1024  # CXR Foundation input size
-
-
-# ---------------------------------------------------------------------------
-# Prediction Audit Logger (FIX #15)
-# ---------------------------------------------------------------------------
-
-class PredictionLogger:
-    """JSON-lines audit logger for all predictions.
-
-    Writes one JSON object per line to a rotating log file.  Privacy-safe:
-    never logs images or full clinical-context text.
-    """
-
-    def __init__(self, log_dir: str = "logs"):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-
-        self.logger = logging.getLogger("edgefracture.predictions")
-        self.logger.setLevel(logging.INFO)
-        self.logger.propagate = False
-
-        if not self.logger.handlers:
-            handler = RotatingFileHandler(
-                self.log_dir / "predictions.jsonl",
-                maxBytes=10 * 1024 * 1024,  # 10 MB
-                backupCount=5,
-            )
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            self.logger.addHandler(handler)
-
-    def log_prediction(
-        self,
-        result: dict,
-        body_region_input: str = "Unknown",
-        clinical_context: str = "",
-        report_type: str = "",
-    ):
-        """Record a single prediction to the audit log.
-
-        Args:
-            result: The classification result dict from FractureClassifier.classify().
-            body_region_input: The body-region value the user originally selected.
-            clinical_context: Raw clinical context string (only its *presence*
-                is logged, never the content -- for patient privacy).
-            report_type: "clinical", "patient", or "" for triage-only calls.
-        """
-        entry = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "probability": result.get("probability"),
-            "triage_level": result.get("triage_level"),
-            "body_region": result.get("body_region"),
-            "body_region_input": body_region_input,
-            "region_auto_detected": result.get("region_auto_detected"),
-            "model_used": result.get("model_used"),
-            "latency_ms": result.get("latency_ms"),
-            "confidence": result.get("confidence"),
-            "image_warnings": result.get("image_warnings"),
-        }
-        if report_type:
-            entry["report_type"] = report_type
-        if clinical_context:
-            entry["had_clinical_context"] = True
-        self.logger.info(json.dumps(entry))
-
-
-prediction_logger = PredictionLogger()
-
-
-# ---------------------------------------------------------------------------
-# CXR Foundation + Linear Probe Classifier
-# ---------------------------------------------------------------------------
-
-class FractureClassifier:
-    """
-    Real CXR Foundation inference → linear probe classification.
-    Falls back to placeholder mode if models aren't available.
-    """
-
-    def __init__(self):
-        self.vision_model = None
-        self.probe = None
-        self.scaler = None
-        self.model_loaded = False
-        self.probe_loaded = False
-        self._tf = None
-        self._try_load()
-
-    # ---- Secure model loading helpers ----
-
-    @staticmethod
-    def _verify_hash(model_path: str) -> bool:
-        """Verify SHA-256 hash of a model file against its sidecar .sha256 file.
-
-        Returns True if the hash matches or no sidecar exists (first-run
-        tolerance). Returns False only when a sidecar exists but the hash
-        does not match, indicating the file may have been tampered with.
-        """
-        hash_path = Path(model_path).with_suffix(
-            Path(model_path).suffix + ".sha256"
-        )
-        if not hash_path.exists():
-            print(f"  (no .sha256 sidecar for {model_path} -- skipping verification)")
-            return True
-
-        expected = hash_path.read_text().strip()
-        actual = hashlib.sha256(Path(model_path).read_bytes()).hexdigest()
-        if actual != expected:
-            print(f"  SHA-256 MISMATCH for {model_path}!")
-            print(f"    expected: {expected}")
-            print(f"    actual:   {actual}")
-            return False
-        return True
-
-    @staticmethod
-    def _load_model_file(path: str):
-        """Load a model file, preferring .joblib with hash verification,
-        falling back to legacy .pkl files for backwards compatibility."""
-        p = Path(path)
-
-        # --- Try .joblib (preferred, safer) ---
-        if p.suffix == ".joblib" and p.exists():
-            if not FractureClassifier._verify_hash(str(p)):
-                raise RuntimeError(
-                    f"Integrity check failed for {p} -- refusing to load"
-                )
-            return joblib.load(p), str(p)
-
-        # --- Try .joblib variant if a .pkl path was given ---
-        joblib_variant = p.with_suffix(".joblib")
-        if joblib_variant.exists():
-            if not FractureClassifier._verify_hash(str(joblib_variant)):
-                raise RuntimeError(
-                    f"Integrity check failed for {joblib_variant} -- refusing to load"
-                )
-            return joblib.load(joblib_variant), str(joblib_variant)
-
-        # --- Fallback: legacy .pkl (backwards compatibility) ---
-        pkl_variant = p.with_suffix(".pkl") if p.suffix != ".pkl" else p
-        for fallback in [p, pkl_variant]:
-            if fallback.exists():
-                print(f"  WARNING: Loading legacy pickle file {fallback}. "
-                      f"Re-run training scripts to save as .joblib with hash verification.")
-                with open(fallback, "rb") as f:
-                    return pickle.load(f), str(fallback)
-
-        raise FileNotFoundError(f"No model file found at {p}, {joblib_variant}, or {pkl_variant}")
-
-    def _try_load(self):
-        # --- Load linear probe ---
-        self.temperature = None
-        if LINEAR_PROBE_PATH:
-            try:
-                data, actual_path = self._load_model_file(LINEAR_PROBE_PATH)
-                if isinstance(data, dict):
-                    self.probe = data["model"]
-                    self.scaler = data.get("scaler")
-                    self.temperature = data.get("temperature")
-                else:
-                    self.probe = data
-                self.probe_loaded = True
-                if self.temperature is not None:
-                    print(f"Linear probe loaded from {actual_path} "
-                          f"(calibrated T={self.temperature:.4f})")
-                else:
-                    print(f"Linear probe loaded from {actual_path}")
-            except FileNotFoundError:
-                pass  # Will be reported below
-            except Exception as e:
-                print(f"Could not load linear probe: {e}")
-
-        # --- Load CXR Foundation vision model ---
-        if CXR_MODEL_PATH and os.path.exists(CXR_MODEL_PATH):
-            try:
-                import tensorflow as tf
-                import tensorflow_text  # registers SentencepieceOp needed by CXR Foundation
-                self._tf = tf
-
-                # Suppress TF warnings for cleaner output
-                tf.get_logger().setLevel("ERROR")
-                os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
-                self.vision_model = tf.saved_model.load(CXR_MODEL_PATH)
-                self.model_loaded = True
-                print(f"CXR Foundation loaded from {CXR_MODEL_PATH}")
-            except ImportError:
-                print("TensorFlow not available -- CXR Foundation won't load")
-            except Exception as e:
-                print(f"Could not load CXR Foundation: {e}")
-
-        if not self.model_loaded:
-            print("CXR Foundation not loaded -- running in PLACEHOLDER mode")
-        if not self.probe_loaded:
-            print("Linear probe not loaded -- running in PLACEHOLDER mode")
-
-    # ---- Image preprocessing (matches extraction script) ----
-
-    def _preprocess_image(self, image: Image.Image) -> bytes:
-        """Convert PIL image to serialized tf.Example (CXR Foundation input format)."""
-        tf = self._tf
-
-        img = image.convert("L")  # Grayscale
-        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS)
-
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
-        png_bytes = buffer.getvalue()
-
-        feature = {
-            "image/encoded": tf.train.Feature(
-                bytes_list=tf.train.BytesList(value=[png_bytes])
-            ),
-        }
-        example = tf.train.Example(
-            features=tf.train.Features(feature=feature)
-        )
-        return example.SerializeToString()
-
-    def _extract_embedding(self, serialized_example: bytes) -> np.ndarray:
-        """Extract raw embedding from CXR Foundation vision encoder."""
-        tf = self._tf
-        input_tensor = tf.constant([serialized_example])
-
-        try:
-            if (hasattr(self.vision_model, "signatures")
-                    and "serving_default" in self.vision_model.signatures):
-                serve_fn = self.vision_model.signatures["serving_default"]
-                input_keys = list(serve_fn.structured_input_signature[1].keys())
-                output = serve_fn(**{input_keys[0]: input_tensor})
-            else:
-                output = self.vision_model(input_tensor)
-        except Exception:
-            output = self.vision_model(inputs=input_tensor)
-
-        if isinstance(output, dict):
-            keys = list(output.keys())
-            emb = output[keys[0]].numpy()
-            return emb[0].flatten()
-        else:
-            return output.numpy()[0].flatten()
-
-    # ---- Input validation ----
-    # FIX #8: Basic image validation — warn (don't block) if the input
-    # doesn't look like an X-ray, to catch accidental uploads of photos, etc.
-
-    @staticmethod
-    def _validate_xray_image(image: Image.Image) -> list[str]:
-        """Check whether an image looks plausibly like an X-ray.
-
-        Returns a list of warning strings (empty if the image passes all checks).
-        This is advisory only — classification still proceeds regardless.
-        """
-        warnings = []
-
-        # 1. Check image dimensions are reasonable for an X-ray
-        #    Typical X-rays are at least a few hundred pixels in each dimension
-        #    and not absurdly small (icons) or huge (ultra-high-res photos).
-        MIN_DIM = 128
-        MAX_DIM = 10000
-        w, h = image.size
-        if w < MIN_DIM or h < MIN_DIM:
-            warnings.append(
-                f"Image is very small ({w}x{h}px). X-rays are typically "
-                f"at least {MIN_DIM}x{MIN_DIM}px."
-            )
-        if w > MAX_DIM or h > MAX_DIM:
-            warnings.append(
-                f"Image is unusually large ({w}x{h}px). This may not be "
-                "a standard X-ray image."
-            )
-
-        # 2. Check if the image is already grayscale or nearly so.
-        #    X-rays are inherently grayscale; a colorful photo is likely not one.
-        if image.mode in ("RGB", "RGBA"):
-            # Sample pixels to check color saturation
-            rgb_image = image.convert("RGB")
-            # Downsample for speed
-            small = rgb_image.resize((64, 64), Image.NEAREST)
-            arr = np.array(small, dtype=np.float32)
-            # Compute per-pixel max channel difference as a saturation proxy
-            channel_range = arr.max(axis=2) - arr.min(axis=2)  # (64, 64)
-            mean_saturation = float(channel_range.mean())
-            # Grayscale images have near-zero channel spread; colorful photos
-            # typically have mean saturation > 30.
-            SATURATION_THRESHOLD = 30.0
-            if mean_saturation > SATURATION_THRESHOLD:
-                warnings.append(
-                    f"Image appears to be a color photograph (mean channel "
-                    f"spread={mean_saturation:.1f}). X-rays are typically "
-                    "grayscale. Results may be unreliable."
-                )
-
-        # 3. Aspect ratio sanity — X-rays are rarely extremely wide or tall
-        aspect = max(w, h) / max(min(w, h), 1)
-        if aspect > 5.0:
-            warnings.append(
-                f"Unusual aspect ratio ({aspect:.1f}:1). This may not be "
-                "a standard X-ray image."
-            )
-
-        return warnings
-
-    # ---- Classification ----
-
-    def classify(self, image: Image.Image, body_region: str = "Unknown") -> dict:
-        start = time.time()
-
-        # Validate that input looks like an X-ray (advisory warnings only)
-        image_warnings = self._validate_xray_image(image)
-
-        region_conf = None
-        region_auto = False
-
-        if self.model_loaded and self.probe_loaded:
-            prob, embedding = self._real_classify(image)
-            model_used = "CXR Foundation + Linear Probe"
-        elif self.probe_loaded and not self.model_loaded:
-            prob = self._placeholder_score(body_region)
-            model_used = "Placeholder (CXR Foundation not loaded)"
-        else:
-            prob = self._placeholder_score(body_region)
-            model_used = "Placeholder (demo mode)"
-
-        latency_ms = (time.time() - start) * 1000
-        triage_level, triage_color = self._triage(prob)
-
-        result = {
-            "probability": round(prob, 3),
-            "triage_level": triage_level,
-            "triage_color": triage_color,
-            "body_region": body_region,
-            "confidence": self._confidence_label(prob),
-            "model_used": model_used,
-            "latency_ms": round(latency_ms, 1),
-            "region_auto_detected": region_auto,
-        }
-
-        # Attach image validation warnings (FIX #8)
-        if image_warnings:
-            result["image_warnings"] = image_warnings
-
-        return result
-
-    def _real_classify(self, image: Image.Image) -> tuple[float, np.ndarray]:
-        """Full pipeline: image → CXR Foundation embedding → linear probe → probability.
-        Returns (probability, embedding) so embedding can be reused for region detection."""
-        # Step 1: Preprocess
-        serialized = self._preprocess_image(image)
-
-        # Step 2: Extract embedding
-        embedding = self._extract_embedding(serialized)  # (88064,)
-
-        # Step 3: Linear probe prediction (with temperature calibration)
-        embedding_2d = embedding.reshape(1, -1)
-        if self.scaler is not None:
-            embedding_2d = self.scaler.transform(embedding_2d)
-        # Raw logit → temperature-scaled sigmoid for calibrated probabilities.
-        # Temperature is loaded from the pkl file (calibrated on held-out set
-        # via scipy.optimize.minimize_scalar on log-loss). Falls back to 3.49
-        # if not available in the pkl (legacy models).
-        logit = self.probe.decision_function(embedding_2d)[0]
-        temperature = self.temperature if self.temperature is not None else 3.49
-        prob = 1.0 / (1.0 + np.exp(-logit / temperature))
-
-        return float(prob), embedding
-
-    def _placeholder_score(self, body_region: str) -> float:
-        demo_scores = {
-            "Hand": 0.62, "Leg": 0.78, "Hip": 0.45,
-            "Shoulder": 0.33, "Unknown": 0.55,
-        }
-        return demo_scores.get(body_region, 0.55)
-
-    @staticmethod
-    def _triage(prob: float) -> tuple[str, str]:
-        if prob >= TRIAGE_THRESHOLDS["red"]:
-            return "HIGH SUSPICION", "red"
-        elif prob >= TRIAGE_THRESHOLDS["yellow"]:
-            return "MODERATE SUSPICION", "yellow"
-        else:
-            return "LOW SUSPICION", "green"
-
-    @staticmethod
-    def _confidence_label(prob: float) -> str:
-        if prob > 0.85 or prob < 0.15:
-            return "high"
-        elif prob > 0.7 or prob < 0.3:
-            return "moderate-high"
-        else:
-            return "moderate"
+try:
+    from .classifier import FractureClassifier
+    from .config import (
+        CXR_MODEL_PATH,
+        CXR_SOFT_LOCK_MARGIN,
+        LINEAR_PROBE_PATH,
+        MEDGEMMA_MODEL,
+        OLLAMA_BASE_URL,
+        SAFETY_AUDIT_ENABLED,
+        SAFETY_AUDIT_TIMEOUT,
+        TRIAGE_THRESHOLDS,
+        VALIDATED_REGIONS,
+    )
+    from .evidence import (
+        get_model_transparency_info as _get_model_transparency_info,
+        get_performance_context as _get_performance_context,
+    )
+    from .prediction_logger import prediction_logger
+    from .ui_cards import (
+        make_reasoning_text as _make_reasoning_text_impl,
+        make_safety_audit_card as _make_safety_audit_card_impl,
+        make_triage_card as _make_triage_card_impl,
+    )
+except ImportError:
+    from classifier import FractureClassifier
+    from config import (
+        CXR_MODEL_PATH,
+        CXR_SOFT_LOCK_MARGIN,
+        LINEAR_PROBE_PATH,
+        MEDGEMMA_MODEL,
+        OLLAMA_BASE_URL,
+        SAFETY_AUDIT_ENABLED,
+        SAFETY_AUDIT_TIMEOUT,
+        TRIAGE_THRESHOLDS,
+        VALIDATED_REGIONS,
+    )
+    from evidence import (
+        get_model_transparency_info as _get_model_transparency_info,
+        get_performance_context as _get_performance_context,
+    )
+    from prediction_logger import prediction_logger
+    from ui_cards import (
+        make_reasoning_text as _make_reasoning_text_impl,
+        make_safety_audit_card as _make_safety_audit_card_impl,
+        make_triage_card as _make_triage_card_impl,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1488,154 +1116,11 @@ def run_safety_audit(image: Image.Image, classification_result: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_model_transparency_info(result: dict) -> str:
-    """Build a transparency explanation of how the AI reached its conclusion."""
-    prob = result["probability"]
-    region = result["body_region"]
-
-    region_context = {
-        "Hand": "metacarpal fractures, phalangeal fractures, boxer's fractures, and scaphoid fractures",
-        "Leg": "tibial shaft fractures, fibula fractures, ankle fractures, and stress fractures",
-        "Hip": "femoral neck fractures, intertrochanteric fractures, and acetabular fractures",
-        "Shoulder": "proximal humerus fractures, clavicle fractures, and scapular fractures",
-    }
-
-    lines = []
-    lines.append("### How This Result Was Produced\n")
-    lines.append(
-        "**Step 0 — Region Detection:** "
-        "[MedGemma 1.5 4B](https://huggingface.co/google/medgemma-1.5-4b-it) "
-        "analyzed the X-ray image to automatically identify the body region "
-        f"(**{region}**). This uses MedGemma's vision capability to classify "
-        "the anatomical area before fracture screening begins.\n"
-    )
-    lines.append(
-        "**Step 1 — Image Analysis:** Your X-ray was processed by "
-        "[CXR Foundation](https://huggingface.co/google/cxr-foundation), "
-        "a medical imaging model from Google Health AI. This model was originally "
-        "trained on **821,000 chest X-rays** and produces rich visual embeddings "
-        "that capture bone and tissue structure.\n"
-    )
-    lines.append(
-        "**Step 2 — Fracture Screening:** The image embeddings (88,064 dimensions) "
-        "were passed through a logistic regression classifier trained on the "
-        "[FracAtlas](https://figshare.com/articles/dataset/The_dataset/22363012) dataset "
-        "(4,083 musculoskeletal X-rays across hand, leg, hip, and shoulder). "
-        f"The classifier estimated a **{round(prob * 100, 1)}% probability** of fracture.\n"
-    )
-    lines.append(
-        "**Step 3 — Clinical Report:** "
-        "[MedGemma 1.5 4B](https://huggingface.co/google/medgemma-1.5-4b-it), "
-        "a medical language model, interpreted the screening score and generated "
-        "a clinical summary. MedGemma also performs a visual safety audit, "
-        "independently assessing the X-ray image to cross-check the CXR Foundation result.\n"
-    )
-    lines.append("### What This Means\n")
-
-    if prob >= 0.70:
-        lines.append(
-            f"A score of **{round(prob * 100, 1)}%** indicates high suspicion of fracture. "
-            f"Common fractures in the {region.lower()} include "
-            f"{region_context.get(region, f'various fracture patterns typical of the {region.lower()}')}. "
-            "**This case should be prioritized for radiologist review.**"
-        )
-    elif prob >= 0.40:
-        lines.append(
-            f"A score of **{round(prob * 100, 1)}%** falls in the uncertain range. "
-            f"The model detected features that partially match fracture patterns in the {region.lower()} "
-            f"(common types: {region_context.get(region, f'various fracture patterns typical of the {region.lower()}')}). "
-            "Additional imaging or clinical correlation is recommended."
-        )
-    else:
-        lines.append(
-            f"A score of **{round(prob * 100, 1)}%** suggests low likelihood of fracture. "
-            f"However, some fracture types in the {region.lower()} "
-            "(e.g., hairline or non-displaced fractures) can be subtle. "
-            "Clinical correlation is always advised."
-        )
-
-    lines.append("\n### Important Limitations\n")
-    lines.append(
-        "- CXR Foundation was trained on **chest X-rays only** — its application to "
-        "musculoskeletal imaging represents a novel transfer learning approach\n"
-        "- This is a **screening tool**, not a diagnostic device\n"
-        "- Performance varies by body region and fracture type\n"
-        "- Always requires review by a qualified healthcare professional"
-    )
-
-    if region not in VALIDATED_REGIONS:
-        lines.append(
-            f"\n- **Unvalidated region:** The linear probe was trained on Hand, Leg, Hip, "
-            f"and Shoulder X-rays only (FracAtlas). Performance on **{region}** X-rays "
-            f"has not been formally validated — interpret with additional caution"
-        )
-
-    return "\n".join(lines)
+    return _get_model_transparency_info(result)
 
 
 def get_performance_context() -> str:
-    """Model performance data from actual experiments."""
-    lines = []
-    lines.append("### Model Performance\n")
-    lines.append(
-        "CXR Foundation was trained exclusively on chest X-rays, yet demonstrates "
-        "strong transfer to musculoskeletal fracture detection — a task it was "
-        "**never designed for**.\n"
-    )
-    lines.append("#### Per-Region AUC (Linear Probe, 5-fold CV)\n")
-    lines.append("| Body Region | Images | Fractures | AUC | 95% Bootstrap CI |")
-    lines.append("|-------------|--------|-----------|-----|------------------|")
-    lines.append("| Hand | 1,510 | 438 | **0.850** | [0.823, 0.876] |")
-    lines.append("| Hip | 179 | 10 | **0.864** | [0.706, 0.972] * |")
-    lines.append("| Leg | 2,237 | 259 | **0.888** | [0.861, 0.913] |")
-    lines.append("| Shoulder | 98 | 10 | **0.848** | [0.667, 0.976] * |")
-    lines.append("| **Overall** | **4,024** | **717** | **0.882** | [0.864, 0.899] |")
-    lines.append("")
-    lines.append(
-        "*\\* Hip and Shoulder each have only 10 fracture cases, producing wide "
-        "confidence intervals (CI width > 0.15). Their AUC point estimates should "
-        "be interpreted with caution — the true AUC could plausibly range from "
-        "~0.67 to ~0.98. More labeled data for these regions would substantially "
-        "narrow the uncertainty.*"
-    )
-
-    lines.append("\n#### Data Efficiency — AUC vs. Training Examples\n")
-    lines.append(
-        "How many labeled X-rays does it take to make a chest X-ray model "
-        "useful for fracture screening?\n"
-    )
-    lines.append("| Training Examples | AUC | Sensitivity | Specificity |")
-    lines.append("|-------------------|-----|-------------|-------------|")
-    lines.append("| 10 | 0.556 | 0.004 | 0.999 |")
-    lines.append("| 25 | 0.578 | 0.015 | 0.991 |")
-    lines.append("| 50 | 0.607 | 0.078 | 0.964 |")
-    lines.append("| 100 | 0.683 | 0.191 | 0.947 |")
-    lines.append("| 250 | 0.785 | 0.421 | 0.912 |")
-    lines.append("| 500 | 0.820 | 0.561 | 0.893 |")
-    lines.append("| **4,024 (all)** | **0.882** | **0.692** | **0.917** |")
-    lines.append(
-        "\n*With just 500 labeled examples, the system crosses the 0.80 AUC threshold "
-        "— demonstrating that pre-trained chest X-ray embeddings encode transferable "
-        "representations for musculoskeletal fracture detection.*"
-    )
-
-    lines.append(
-        "\n*Performance data covers the 4 body regions in the FracAtlas dataset. "
-        "For X-rays from other body regions, the model has not been formally evaluated. "
-        "The CXR Foundation embeddings may still transfer effectively, but AUC estimates "
-        "are unavailable.*"
-    )
-
-    lines.append("\n### Edge Deployment\n")
-    lines.append("| Metric | Target | Status |")
-    lines.append("|--------|--------|--------|")
-    lines.append("| Device | Jetson Orin Nano 8GB | ✓ |")
-    lines.append("| Device cost | $249 | ✓ |")
-    lines.append("| CXR Foundation latency | < 3s | *pending Jetson benchmarks* |")
-    lines.append("| MedGemma report latency | < 90s | *pending Jetson benchmarks* |")
-    lines.append("| Total memory (both models) | < 6GB | *pending Jetson benchmarks* |")
-    lines.append("| Internet required | None | ✓ Fully offline |")
-
-    return "\n".join(lines)
+    return _get_performance_context()
 
 
 # ---------------------------------------------------------------------------
@@ -1886,160 +1371,15 @@ def step_show_evidence(state):
 # ---------------------------------------------------------------------------
 
 def _make_triage_card(result: dict) -> str:
-    color_map = {
-        "red": ("#dc2626", "#fff", "🔴"),
-        "yellow": ("#d97706", "#000", "🟡"),
-        "green": ("#16a34a", "#fff", "🟢"),
-    }
-    bg, fg, icon = color_map[result["triage_color"]]
-    prob_pct = round(result["probability"] * 100, 1)
-
-    return f"""
-    <div style="padding:32px; border-radius:16px; background:{bg}; color:{fg};
-                font-family:system-ui; text-align:center; margin:8px 0;">
-        <div style="font-size:52px; margin-bottom:8px;">{icon}</div>
-        <div style="font-size:24px; font-weight:700; letter-spacing:1px; margin-bottom:4px;">
-            {result['triage_level']}
-        </div>
-        <div style="font-size:48px; font-weight:800; margin:8px 0;">
-            {prob_pct}%
-        </div>
-        <div style="font-size:15px; opacity:0.9;">
-            Fracture probability · {result['body_region']} X-ray
-        </div>
-    </div>
-    """
+    return _make_triage_card_impl(result)
 
 
 def _make_reasoning_text(result: dict) -> str:
-    prob = result["probability"]
-    region = result["body_region"]
-    model = result["model_used"]
-    latency = result["latency_ms"]
-
-    lines = []
-    lines.append(
-        f"**Classification:** "
-        f"{'Fracture detected' if prob >= 0.5 else 'No fracture detected'}"
-    )
-    lines.append(f"**Confidence:** {result['confidence']}")
-    if result.get("region_auto_detected"):
-        lines.append(
-            f"**Body region:** {region} *(auto-detected by MedGemma)*"
-        )
-    else:
-        lines.append(f"**Body region:** {region}")
-    lines.append(f"**Model:** {model}")
-    lines.append(f"**Latency:** {latency}ms")
-    lines.append("")
-
-    if prob >= 0.70:
-        lines.append(
-            f"⚡ The model detected strong fracture-like patterns in this "
-            f"{region.lower()} X-ray. This case should be **prioritized** "
-            "for radiologist review."
-        )
-    elif prob >= 0.40:
-        lines.append(
-            f"The model detected some features consistent with fracture patterns "
-            f"in the {region.lower()}, but with moderate uncertainty. Additional "
-            "imaging or clinical correlation is recommended."
-        )
-    else:
-        lines.append(
-            f"The model did not detect strong fracture patterns in this "
-            f"{region.lower()} X-ray. However, subtle or non-displaced fractures "
-            "can be missed. Clinical judgment should always take precedence."
-        )
-
-    return "\n\n".join(lines)
+    return _make_reasoning_text_impl(result)
 
 
 def _make_safety_audit_card(audit_result: dict) -> str:
-    """Build HTML card for the safety audit cross-check result."""
-    if audit_result.get("skipped"):
-        reason = audit_result.get("reason", "Safety audit skipped")
-        return f"""
-        <div style="padding:16px; border-radius:12px; background:#374151; color:#9ca3af;
-                    font-family:system-ui; margin:8px 0; border:1px solid #4b5563;">
-            <div style="font-size:14px; font-weight:600; margin-bottom:4px;">
-                ⏭️ Safety Audit Skipped
-            </div>
-            <div style="font-size:13px;">{reason}</div>
-        </div>
-        """
-
-    concordance = audit_result.get("concordance", "UNCERTAIN")
-
-    style_map = {
-        "CONCORDANT": ("#065f46", "#d1fae5", "#047857", "✅", "Both models agree"),
-        "DISCORDANT": (
-            "#991b1b", "#fef2f2", "#dc2626", "⚠️",
-            "Models DISAGREE — review needed",
-        ),
-        "UNCERTAIN": (
-            "#92400e", "#fffbeb", "#d97706", "❓",
-            "Cross-check inconclusive",
-        ),
-    }
-    text_color, bg_color, border_color, icon, headline = style_map.get(
-        concordance, style_map["UNCERTAIN"]
-    )
-
-    # Build observations list (cap at 5)
-    observations = audit_result.get("observations", [])[:5]
-    obs_html = ""
-    if observations:
-        obs_items = "".join(f"<li>{obs}</li>" for obs in observations)
-        obs_html = (
-            '<div style="margin-top:8px;">'
-            '<div style="font-size:12px; font-weight:600; margin-bottom:4px;">'
-            "Visual Observations:</div>"
-            f'<ul style="margin:0; padding-left:20px; font-size:12px;">'
-            f"{obs_items}</ul></div>"
-        )
-
-    reasoning = audit_result.get("reasoning", "")
-    reasoning_html = ""
-    if reasoning:
-        reasoning_html = (
-            f'<div style="margin-top:8px; font-size:12px; '
-            f'font-style:italic; opacity:0.85;">{reasoning}</div>'
-        )
-
-    error = audit_result.get("error")
-    error_html = ""
-    if error:
-        error_html = (
-            f'<div style="margin-top:6px; font-size:11px; '
-            f'color:#dc2626;">Error: {error}</div>'
-        )
-
-    latency = audit_result.get("latency_s", "")
-    latency_html = f" · {latency}s" if latency else ""
-
-    border_style = (
-        f"3px solid {border_color}" if concordance == "DISCORDANT"
-        else f"1px solid {border_color}"
-    )
-
-    return f"""
-    <div style="padding:16px; border-radius:12px; background:{bg_color}; color:{text_color};
-                font-family:system-ui; margin:8px 0; border:{border_style};">
-        <div style="font-size:16px; font-weight:700; margin-bottom:4px;">
-            {icon} {headline}
-        </div>
-        <div style="font-size:13px; opacity:0.8;">
-            MedGemma Visual Safety Audit{latency_html}
-        </div>
-        {obs_html}
-        {reasoning_html}
-        {error_html}
-        <div style="margin-top:10px; font-size:11px; opacity:0.6;">
-            This is an AI cross-check, not a diagnosis. Always defer to clinical judgment.
-        </div>
-    </div>
-    """
+    return _make_safety_audit_card_impl(audit_result)
 
 
 # ---------------------------------------------------------------------------
