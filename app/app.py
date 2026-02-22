@@ -190,13 +190,15 @@ class FractureClassifier:
             return joblib.load(joblib_variant), str(joblib_variant)
 
         # --- Fallback: legacy .pkl (backwards compatibility) ---
-        if p.exists():
-            print(f"  WARNING: Loading legacy pickle file {p}. "
-                  f"Re-run training scripts to save as .joblib with hash verification.")
-            with open(p, "rb") as f:
-                return pickle.load(f), str(p)
+        pkl_variant = p.with_suffix(".pkl") if p.suffix != ".pkl" else p
+        for fallback in [p, pkl_variant]:
+            if fallback.exists():
+                print(f"  WARNING: Loading legacy pickle file {fallback}. "
+                      f"Re-run training scripts to save as .joblib with hash verification.")
+                with open(fallback, "rb") as f:
+                    return pickle.load(f), str(fallback)
 
-        raise FileNotFoundError(f"No model file found at {p} or {joblib_variant}")
+        raise FileNotFoundError(f"No model file found at {p}, {joblib_variant}, or {pkl_variant}")
 
     def _try_load(self):
         # --- Load linear probe ---
@@ -1115,8 +1117,6 @@ footer { display: none !important; }
 def build_ui():
     with gr.Blocks(
         title="EdgeFracture — Fracture Triage",
-        theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate"),
-        css=CUSTOM_CSS,
     ) as app:
 
         triage_state = gr.State(value=None)
@@ -1400,4 +1400,8 @@ if __name__ == "__main__":
     print("=" * 60)
 
     app = build_ui()
-    app.launch(server_name=args.host, server_port=args.port, share=args.share)
+    app.launch(
+        server_name=args.host, server_port=args.port, share=args.share,
+        theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate"),
+        css=CUSTOM_CSS,
+    )
