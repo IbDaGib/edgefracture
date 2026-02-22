@@ -1077,11 +1077,12 @@ def check_ollama_status():
 
 
 def step_triage(image, body_region, clinical_context):
-    """Step 1 → Step 2: Run triage classification."""
+    """Step 1 → Step 2 + Step 3: Run triage and auto-generate both reports."""
     if image is None:
         return (
             gr.update(visible=False), "", "",
             gr.update(visible=False), None,
+            "", "", "", "",
         )
 
     pil_image = (
@@ -1104,12 +1105,23 @@ def step_triage(image, body_region, clinical_context):
     triage_html = _make_triage_card(result)
     reasoning = _make_reasoning_text(result)
 
+    # Auto-generate both reports
+    clinical = generate_report(result, clinical_context or "", report_type="clinical")
+    clinical_narrative, clinical_json = _format_report_output(clinical)
+
+    patient = generate_report(result, clinical_context or "", report_type="patient")
+    patient_narrative, patient_json = _format_report_output(patient)
+
     return (
         gr.update(visible=True),
         triage_html,
         reasoning,
         gr.update(visible=True),
         state,
+        clinical_narrative,
+        clinical_json,
+        patient_narrative,
+        patient_json,
     )
 
 
@@ -1322,22 +1334,15 @@ def build_ui():
                     gr.Markdown("---")
                     gr.Markdown("#### Step 3 — AI Clinical Report")
                     gr.Markdown(
-                        "*MedGemma generates separate reports for clinicians "
-                        "and patients. Clinical context (if provided above) is "
-                        "included in the prompt.*"
+                        "*MedGemma automatically generates reports for clinicians "
+                        "and patients after triage. Clinical context (if provided "
+                        "above) is included in the prompt.*"
                     )
-                    with gr.Row():
-                        clinical_btn = gr.Button(
-                            "🩺 Generate Clinician Report", variant="primary",
-                        )
-                        patient_btn = gr.Button(
-                            "💬 Generate Patient Explanation", variant="secondary",
-                        )
 
                     with gr.Tabs():
                         with gr.Tab("🩺 Clinician View"):
                             clinical_report_md = gr.Markdown(
-                                "*Click 'Generate Clinician Report' above.*"
+                                "*Report will appear after triage analysis.*"
                             )
                             with gr.Accordion(
                                 "📦 Structured JSON (machine-readable)", open=False,
@@ -1345,7 +1350,7 @@ def build_ui():
                                 clinical_json_md = gr.Markdown("")
                         with gr.Tab("💬 Patient View"):
                             patient_report_md = gr.Markdown(
-                                "*Click 'Generate Patient Explanation' above.*"
+                                "*Report will appear after triage analysis.*"
                             )
                             with gr.Accordion(
                                 "📦 Structured JSON (machine-readable)", open=False,
@@ -1491,19 +1496,9 @@ def build_ui():
             outputs=[
                 step2_container, triage_card, reasoning_text,
                 step3_container, triage_state,
+                clinical_report_md, clinical_json_md,
+                patient_report_md, patient_json_md,
             ],
-        )
-
-        clinical_btn.click(
-            fn=step_clinical_report,
-            inputs=[triage_state],
-            outputs=[clinical_report_md, clinical_json_md],
-        )
-
-        patient_btn.click(
-            fn=step_patient_report,
-            inputs=[triage_state],
-            outputs=[patient_report_md, patient_json_md],
         )
 
         evidence_btn.click(
