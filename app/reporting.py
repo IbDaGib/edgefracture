@@ -510,6 +510,75 @@ def clean_medgemma_output(text: str) -> str:
     return text
 
 
+def _synthesize_fallback_json(
+    report_type: str,
+    classification_result: dict,
+    anchor_context: dict | None,
+) -> dict:
+    """Build structured JSON from programmatic data when MedGemma fails to produce JSON."""
+    prob = classification_result["probability"]
+    body_region = classification_result.get("body_region", "Unknown")
+    classification = "Fracture detected" if prob >= 0.5 else "No fracture detected"
+    confidence = classification_result.get("confidence", "Unknown")
+    triage_level = classification_result.get("triage_level", "Unknown")
+
+    if report_type == "clinical":
+        fallback: dict = {
+            "anchor_impression": classification,
+            "anatomic_location": body_region,
+            "urgency": (anchor_context or {}).get("final_urgency", triage_level.upper()),
+            "confidence_rationale": f"CXR model confidence: {confidence} ({round(prob * 100, 1)}%)",
+            "discordance_note": (anchor_context or {}).get("discordance_note", ""),
+        }
+        if anchor_context:
+            if anchor_context.get("urgency_adjusted"):
+                fallback["urgency_rationale"] = (
+                    "Urgency was adjusted based on cross-check with visual audit."
+                )
+            fallback["likely_fracture_pattern"] = (
+                "Requires further imaging for definitive characterisation."
+            )
+        if prob >= 0.5:
+            fallback["immediate_actions"] = (
+                "Correlate clinically; consider additional imaging as indicated."
+            )
+        else:
+            fallback["immediate_actions"] = (
+                "Routine follow-up; re-image if symptoms persist."
+            )
+        return fallback
+
+    # Patient report
+    if prob >= 0.5:
+        summary = (
+            f"The X-ray analysis of your {body_region.lower()} suggests a possible fracture "
+            f"(confidence: {confidence.lower()})."
+        )
+        next_steps = (
+            "Your doctor will review these results and may order additional imaging "
+            "to get a clearer picture."
+        )
+        reassurance = (
+            "Finding a possible fracture early means your care team can act quickly. "
+            "You are in good hands."
+        )
+    else:
+        summary = (
+            f"The X-ray analysis of your {body_region.lower()} did not detect signs of a fracture "
+            f"(confidence: {confidence.lower()})."
+        )
+        next_steps = (
+            "Your doctor will review these results. If your symptoms continue, "
+            "they may recommend further evaluation."
+        )
+        reassurance = (
+            "A negative result is reassuring, but always follow up with your doctor "
+            "if you have ongoing pain or concerns."
+        )
+
+    return {"summary": summary, "next_steps": next_steps, "reassurance": reassurance}
+
+
 def generate_report(
     classification_result: dict,
     clinical_context: str = "",
@@ -538,7 +607,7 @@ def generate_report(
         build_clinical_summary_section(clinical_summary) if report_type == "patient" else ""
     )
 
-    base_kwargs = dict(
+    prompt_kwargs = dict(
         body_region=classification_result["body_region"],
         score_pct=round(prob * 100, 1),
         triage_level=classification_result["triage_level"],
@@ -546,15 +615,9 @@ def generate_report(
         confidence=classification_result["confidence"],
         anchor_context_section=anchor_context_section,
         clinical_context_section=context_section,
-        audit_findings_section="",
-        clinical_summary_section="",
+        audit_findings_section=audit_section,
+        clinical_summary_section=clinical_section,
     )
-
-    narrative_kwargs = {
-        **base_kwargs,
-        "audit_findings_section": audit_section,
-        "clinical_summary_section": clinical_section,
-    }
 
     json_template = CLINICAL_JSON_PROMPT if report_type == "clinical" else PATIENT_JSON_PROMPT
     narrative_template = CLINICAL_PROMPT if report_type == "clinical" else PATIENT_PROMPT
@@ -562,7 +625,7 @@ def generate_report(
 
     start = time.time()
     try:
-        json_prompt = json_template.format(**base_kwargs)
+        json_prompt = json_template.format(**prompt_kwargs)
         data = call_medgemma(json_prompt)
         raw_response = data.get("response", "").strip()
         parsed = parse_json_response(raw_response)
@@ -572,7 +635,11 @@ def generate_report(
                 parsed = normalize_clinical_structured_json(parsed, anchor_context=anchor_context)
             report_text = render_fn(parsed)
         else:
-            narrative_prompt = narrative_template.format(**narrative_kwargs)
+            # Synthesize structured JSON from programmatic data
+            parsed = _synthesize_fallback_json(
+                report_type, classification_result, anchor_context
+            )
+            narrative_prompt = narrative_template.format(**prompt_kwargs)
             data = call_medgemma(narrative_prompt)
             report_text = clean_medgemma_output(data.get("response", "").strip())
 

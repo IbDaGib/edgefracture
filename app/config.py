@@ -13,6 +13,10 @@ SAFETY_AUDIT_ENABLED = (
 )
 SAFETY_AUDIT_TIMEOUT = int(os.environ.get("SAFETY_AUDIT_TIMEOUT", "180"))
 
+XRAY_GUARD_ENABLED = (
+    os.environ.get("XRAY_GUARD_ENABLED", "true").lower() == "true"
+)
+
 TRIAGE_THRESHOLDS = {"red": 0.70, "yellow": 0.40}
 VALIDATED_REGIONS = {"Hand", "Leg", "Hip", "Shoulder"}
 CXR_SOFT_LOCK_MARGIN = float(os.environ.get("CXR_SOFT_LOCK_MARGIN", "0.05"))
