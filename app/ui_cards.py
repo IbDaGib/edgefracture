@@ -1,4 +1,4 @@
-"""HTML/text card builders for triage, safety audit, and X-ray guard UI."""
+"""HTML/text card builders for triage and safety audit UI."""
 
 
 def make_triage_card(result: dict) -> str:
@@ -158,37 +158,6 @@ def make_safety_audit_card(audit_result: dict) -> str:
         {error_html}
         <div style="margin-top:10px; font-size:11px; opacity:0.6;">
             This is an AI cross-check, not a diagnosis. Always defer to clinical judgment.
-        </div>
-    </div>
-    """
-
-
-def make_xray_guard_card(guard_result: dict) -> str:
-    """Build HTML rejection card when the uploaded image is not an X-ray."""
-    modality = guard_result.get("modality", "unknown").replace("_", " ").title()
-    reason = guard_result.get("reason", "")
-    latency = guard_result.get("latency_s", "")
-    latency_html = f" · {latency}s" if latency else ""
-
-    return f"""
-    <div style="padding:24px; border-radius:14px; background:#1e293b; color:#cbd5e1;
-                font-family:system-ui; text-align:center; margin:8px 0;
-                border:2px solid #475569;">
-        <div style="font-size:48px; margin-bottom:8px;">&#x1F6AB;</div>
-        <div style="font-size:22px; font-weight:700; color:#f1f5f9; margin-bottom:6px;">
-            Not an X-ray
-        </div>
-        <div style="font-size:15px; margin-bottom:12px; color:#94a3b8;">
-            Detected modality: <strong style="color:#e2e8f0;">{modality}</strong>
-        </div>
-        <div style="font-size:13px; margin-bottom:16px; color:#94a3b8; font-style:italic;">
-            {reason}
-        </div>
-        <div style="font-size:13px; color:#64748b;">
-            Please upload a conventional plain-film X-ray (radiograph) for fracture analysis.
-        </div>
-        <div style="margin-top:10px; font-size:11px; color:#475569;">
-            MedGemma X-ray Guard{latency_html}
         </div>
     </div>
     """

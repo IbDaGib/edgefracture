@@ -58,23 +58,6 @@ Forearm, Shoulder, Humerus, Spine, Ribs, Hip, Pelvis, Knee, Leg, Ankle, Foot)
 - Choose the MOST SPECIFIC region you can identify
 - If you cannot determine the region, respond: {{"region": "Unknown"}}"""
 
-XRAY_GUARD_PROMPT = """\
-You are a medical imaging assistant. Examine this image and determine \
-whether it is a conventional X-ray (radiograph).
-
-Respond with ONLY a valid JSON object (no markdown, no code fences, no extra text) \
-using this exact schema:
-
-{{"is_xray": true, "modality": "<detected imaging modality>", "reason": "<brief explanation>"}}
-
-IMPORTANT:
-- "is_xray" must be true ONLY for conventional plain-film X-rays (radiographs)
-- Set "is_xray" to false for: photographs, CT scans, MRI scans, ultrasound, \
-documents, diagrams, screenshots, non-medical images, or any other non-radiograph content
-- "modality" should be one of: "xray", "ct", "mri", "ultrasound", "photograph", \
-"document", "diagram", "unknown"
-- Be conservative: if uncertain, set "is_xray" to false"""
-
 COMMON_REGIONS = [
     "Hand",
     "Wrist",
@@ -197,67 +180,6 @@ def detect_region_medgemma(
         return ("Unknown", False)
     except Exception:
         return ("Unknown", False)
-
-
-def check_xray_image(
-    image: Image.Image,
-    *,
-    xray_guard_enabled: bool,
-    is_vision_available,
-    call_medgemma_vision,
-    parse_json_response,
-) -> dict:
-    """Check whether an image is a conventional X-ray using MedGemma vision.
-
-    Returns dict with keys: is_xray, modality, reason, latency_s, skipped.
-    Fails open (is_xray=True) when guard is disabled, vision unavailable,
-    parse fails, or an exception occurs.
-    """
-    default_pass = {
-        "is_xray": True,
-        "modality": "unknown",
-        "reason": "",
-        "latency_s": 0.0,
-        "skipped": True,
-    }
-
-    if not xray_guard_enabled:
-        return {**default_pass, "reason": "X-ray guard disabled"}
-
-    if not is_vision_available():
-        return {**default_pass, "reason": "MedGemma vision not available"}
-
-    start = time.time()
-    try:
-        data = call_medgemma_vision(XRAY_GUARD_PROMPT, image)
-        raw = data.get("response", "").strip()
-        parsed = parse_json_response(raw)
-
-        latency = round(time.time() - start, 1)
-
-        if parsed is None:
-            return {
-                "is_xray": True,
-                "modality": "unknown",
-                "reason": "Could not parse MedGemma response",
-                "latency_s": latency,
-                "skipped": False,
-            }
-
-        return {
-            "is_xray": bool(parsed.get("is_xray", True)),
-            "modality": str(parsed.get("modality", "unknown")).lower(),
-            "reason": str(parsed.get("reason", "")),
-            "latency_s": latency,
-            "skipped": False,
-        }
-    except Exception:
-        return {
-            **default_pass,
-            "latency_s": round(time.time() - start, 1),
-            "reason": "Guard rail error — defaulting to pass",
-            "skipped": False,
-        }
 
 
 def run_safety_audit(

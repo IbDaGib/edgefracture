@@ -33,7 +33,6 @@ try:
         SAFETY_AUDIT_TIMEOUT,
         TRIAGE_THRESHOLDS,
         VALIDATED_REGIONS,
-        XRAY_GUARD_ENABLED,
     )
     from .evidence import (
         get_model_transparency_info as _get_model_transparency_info,
@@ -68,7 +67,6 @@ try:
         REGION_DETECT_PROMPT as _REGION_DETECT_PROMPT,
         SAFETY_AUDIT_PROMPT as _SAFETY_AUDIT_PROMPT,
         check_vision_support as _check_vision_support_impl,
-        check_xray_image as _check_xray_image_impl,
         compute_concordance as _compute_concordance_impl,
         detect_region_medgemma as _detect_region_medgemma_impl,
         run_safety_audit as _run_safety_audit_impl,
@@ -77,7 +75,6 @@ try:
         make_reasoning_text as _make_reasoning_text_impl,
         make_safety_audit_card as _make_safety_audit_card_impl,
         make_triage_card as _make_triage_card_impl,
-        make_xray_guard_card as _make_xray_guard_card_impl,
     )
 except ImportError:
     from classifier import FractureClassifier
@@ -91,7 +88,6 @@ except ImportError:
         SAFETY_AUDIT_TIMEOUT,
         TRIAGE_THRESHOLDS,
         VALIDATED_REGIONS,
-        XRAY_GUARD_ENABLED,
     )
     from evidence import (
         get_model_transparency_info as _get_model_transparency_info,
@@ -126,7 +122,6 @@ except ImportError:
         REGION_DETECT_PROMPT as _REGION_DETECT_PROMPT,
         SAFETY_AUDIT_PROMPT as _SAFETY_AUDIT_PROMPT,
         check_vision_support as _check_vision_support_impl,
-        check_xray_image as _check_xray_image_impl,
         compute_concordance as _compute_concordance_impl,
         detect_region_medgemma as _detect_region_medgemma_impl,
         run_safety_audit as _run_safety_audit_impl,
@@ -135,7 +130,6 @@ except ImportError:
         make_reasoning_text as _make_reasoning_text_impl,
         make_safety_audit_card as _make_safety_audit_card_impl,
         make_triage_card as _make_triage_card_impl,
-        make_xray_guard_card as _make_xray_guard_card_impl,
     )
 
 
@@ -301,16 +295,6 @@ def _detect_region_medgemma(image: Image.Image) -> tuple[str, bool]:
     )
 
 
-def _check_xray_image(image: Image.Image) -> dict:
-    return _check_xray_image_impl(
-        image,
-        xray_guard_enabled=XRAY_GUARD_ENABLED,
-        is_vision_available=is_vision_available,
-        call_medgemma_vision=_call_medgemma_vision,
-        parse_json_response=_parse_json_response,
-    )
-
-
 def generate_report(
     classification_result: dict,
     clinical_context: str = "",
@@ -404,19 +388,6 @@ def run_batch_triage(files):
         filename = Path(filepath).name
         try:
             img = Image.open(filepath)
-
-            guard_result = _check_xray_image(img)
-            if not guard_result["is_xray"]:
-                rows.append({
-                    "": "\U0001F6AB",
-                    "File": filename,
-                    "Fracture %": "N/A",
-                    "Triage": "Not an X-ray",
-                    "Region": guard_result.get("modality", "unknown"),
-                    "Latency": f"{guard_result.get('latency_s', 0)}s",
-                })
-                continue
-
             body_region, _detected = _detect_region_medgemma(img)
             result = get_classifier().classify(img, body_region)
             result["region_auto_detected"] = _detected
@@ -452,7 +423,7 @@ def run_batch_triage(files):
     # Errors (non-numeric values) sort to the end with -1 sentinel.
     rows.sort(
         key=lambda r: float(r["Fracture %"].rstrip("%"))
-        if r["Fracture %"] not in ("Error", "-", "N/A")
+        if r["Fracture %"] not in ("Error", "-")
         else -1,
         reverse=True,
     )
@@ -469,12 +440,9 @@ def run_batch_triage(files):
     summary_red = sum(1 for r in rows if r[""] == "🔴")
     summary_yellow = sum(1 for r in rows if r[""] == "🟡")
     summary_green = sum(1 for r in rows if r[""] == "🟢")
-    summary_rejected = sum(1 for r in rows if r[""] == "\U0001F6AB")
 
     md += f"\n**Summary:** {len(rows)} images processed — "
     md += f"🔴 {summary_red} high · 🟡 {summary_yellow} moderate · 🟢 {summary_green} low"
-    if summary_rejected:
-        md += f" · \U0001F6AB {summary_rejected} rejected"
 
     return md
 
@@ -512,11 +480,6 @@ def check_ollama_status():
                 status += f" · Safety audit: {'ready' if has_medgemma else 'model not found'}"
             else:
                 status += " · Safety audit: disabled"
-            # X-ray guard status
-            if XRAY_GUARD_ENABLED:
-                status += f" · X-ray guard: {'ready' if has_medgemma else 'model not found'}"
-            else:
-                status += " · X-ray guard: disabled"
             return status
         return "⚠️ Ollama error"
     except requests.ConnectionError:
@@ -538,22 +501,6 @@ def step_triage(image, clinical_context):
     pil_image = (
         Image.fromarray(image) if not isinstance(image, Image.Image) else image
     )
-
-    # X-ray guard rail: reject non-radiograph images before any analysis
-    guard_result = _check_xray_image(pil_image)
-    if not guard_result["is_xray"]:
-        rejection_html = _make_xray_guard_card(guard_result)
-        rejection_reasoning = (
-            f"**Image rejected:** Detected as *{guard_result.get('modality', 'unknown')}*, "
-            f"not a conventional X-ray.\n\n{guard_result.get('reason', '')}"
-        )
-        return (
-            gr.update(visible=True), rejection_html, rejection_reasoning,
-            gr.update(visible=False), "",
-            gr.update(visible=False), None,
-            "", "", "", "",
-        )
-
     body_region, region_detected = _detect_region_medgemma(pil_image)
     result = get_classifier().classify(pil_image, body_region)
     result["region_auto_detected"] = region_detected
@@ -683,10 +630,6 @@ def _make_reasoning_text(result: dict) -> str:
 
 def _make_safety_audit_card(audit_result: dict) -> str:
     return _make_safety_audit_card_impl(audit_result)
-
-
-def _make_xray_guard_card(guard_result: dict) -> str:
-    return _make_xray_guard_card_impl(guard_result)
 
 
 # ---------------------------------------------------------------------------
@@ -918,7 +861,6 @@ def build_ui():
                             - **Linear probe:** `{'Loaded ✓ (0.882 AUC)' if get_classifier().probe_loaded else 'Not loaded — placeholder mode'}`
                             - **Region detection:** `MedGemma vision (auto)`
                             - **Safety Audit:** `{'Enabled ✓ — MedGemma vision cross-check' if SAFETY_AUDIT_ENABLED else 'Disabled'}`
-                            - **X-ray Guard:** `{'Enabled ✓ — rejects non-radiograph images' if XRAY_GUARD_ENABLED else 'Disabled'}`
                             """
                         )
 
