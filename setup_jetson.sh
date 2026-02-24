@@ -15,38 +15,56 @@ echo "[1/6] Installing system packages..."
 sudo apt-get update
 sudo apt-get install -y python3-pip python3-venv git curl
 
-# 2. Virtual environment
+# 2. Virtual environment (with system-site-packages to see Jetson's CUDA)
 echo "[2/6] Creating Python environment..."
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv --system-site-packages venv311
+source venv311/bin/activate
 
-# 3. PyTorch for Jetson (JetPack-compatible wheels)
-echo "[3/6] Installing PyTorch for Jetson..."
-# JetPack 6.x comes with PyTorch support. If not pre-installed:
+# 3. PyTorch + TensorFlow for Jetson (JetPack-compatible wheels)
+echo "[3/7] Installing PyTorch for Jetson..."
 pip install --upgrade pip
-# For Jetson Orin Nano with JetPack 6.x, use the NVIDIA-provided wheel:
-# Check https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048
-# pip install torch torchvision --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/
-pip install torch torchvision 2>/dev/null || echo "NOTE: Install PyTorch from NVIDIA Jetson wheels if this fails"
+# For JetPack 6.2+ (CUDA 12.6), use the Jetson AI Lab index:
+pip install --no-cache-dir \
+    torch==2.8.0 torchvision==0.23.0 \
+    --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126 2>/dev/null || \
+    echo "NOTE: PyTorch install failed. Check https://pypi.jetson-ai-lab.io for your JetPack version."
+
+echo "[3/7] Installing TensorFlow for Jetson (needed for CXR Foundation)..."
+pip install --no-cache-dir tensorflow>=2.16.0 2>/dev/null || \
+    echo "NOTE: TensorFlow install failed. You can still use pre-extracted embeddings."
+pip install tensorflow-text>=2.16.0 2>/dev/null || true
 
 # 4. Python dependencies
-echo "[4/6] Installing Python packages..."
+echo "[4/7] Installing Python packages..."
 pip install -r requirements.txt
 
 # 5. Ollama for MedGemma
-echo "[5/6] Installing Ollama..."
+echo "[5/7] Installing Ollama..."
 if ! command -v ollama &> /dev/null; then
     curl -fsSL https://ollama.com/install.sh | sh
 fi
 
-echo "[5/6] Pulling MedGemma model..."
-# Try the Q4 quantized version first (fits in 8GB)
+echo "[5/7] Pulling MedGemma model..."
+# Try Ollama registry first, then Unsloth GGUF fallback
+ollama pull alibayram/medgemma 2>/dev/null || \
 ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M 2>/dev/null || \
-ollama pull medgemma 2>/dev/null || \
-echo "WARNING: Could not pull MedGemma. You may need to manually download a GGUF."
+echo "WARNING: Could not pull MedGemma. See JETSON_QUICKSTART.md Section 7 for manual options."
 
-# 6. HuggingFace login
-echo "[6/6] HuggingFace authentication..."
+# 6. Swap space (important for 8GB unified memory)
+echo "[6/7] Adding swap space..."
+if [ ! -f /swapfile ]; then
+    sudo fallocate -l 4G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+    echo '/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab
+    echo "4GB swap added."
+else
+    echo "Swap file already exists, skipping."
+fi
+
+# 7. HuggingFace login
+echo "[7/7] HuggingFace authentication..."
 echo "You need a HuggingFace token to download CXR Foundation (gated model)."
 echo "1. Go to https://huggingface.co/settings/tokens"
 echo "2. Create a token with 'read' access"
@@ -64,7 +82,7 @@ echo "=========================================="
 echo "Setup complete! Next steps:"
 echo "=========================================="
 echo ""
-echo "  source venv/bin/activate"
+echo "  source venv311/bin/activate"
 echo ""
 echo "  # Download data and models"
 echo "  python scripts/download_fracatlas.py"

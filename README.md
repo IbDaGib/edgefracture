@@ -55,8 +55,8 @@ git clone https://github.com/YOUR_USERNAME/edgefracture.git
 cd edgefracture
 
 # Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv311
+source venv311/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
