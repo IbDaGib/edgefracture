@@ -86,6 +86,21 @@ class FractureClassifier:
             f"No model file found at {p}, {joblib_variant}, or {pkl_variant}"
         )
 
+    def release_model(self):
+        """Free CXR Foundation GPU memory so MedGemma can run."""
+        if self.vision_model is not None:
+            del self.vision_model
+            self.vision_model = None
+            self.model_loaded = False
+            if self._tf is not None:
+                import gc
+                gc.collect()
+                try:
+                    self._tf.keras.backend.clear_session()
+                except Exception:
+                    pass
+            print("CXR Foundation released from memory")
+
     def _try_load(self):
         self.temperature = None
         if LINEAR_PROBE_PATH:

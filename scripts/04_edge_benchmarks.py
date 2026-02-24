@@ -291,20 +291,21 @@ Important: This is an AI screening result, not a diagnosis."""
 
     try:
         import ollama
-        
-        # Check if model is available
-        models = ollama.list()
-        medgemma_model = None
-        for m in models.get("models", []):
-            if "medgemma" in m.get("name", "").lower():
-                medgemma_model = m["name"]
-                break
-        
-        if not medgemma_model:
-            print("MedGemma not found in Ollama. Available models:")
-            for m in models.get("models", []):
-                print(f"  {m['name']}")
-            return {"error": "MedGemma not found in Ollama", "note": "Run: ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M"}
+        medgemma_model = "hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M"
+
+#        # Check if model is available
+#        models = ollama.list()
+#        medgemma_model = "hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M"
+#        for m in models.get("models", []):
+#            if "medgemma" in m.get("name", "").lower():
+#                medgemma_model = m["name"]
+#                break
+#
+#        if not medgemma_model:
+#            print("MedGemma not found in Ollama. Available models:")
+#            for m in models.get("models", []):
+#                print(f"  {m['name']}")
+#            return {"error": "MedGemma not found in Ollama", "note": "Run: ollama pull hf.co/unsloth/medgemma-1.5-4b-it-GGUF:Q4_K_M"}
         
         print(f"Using model: {medgemma_model}")
         
@@ -389,7 +390,7 @@ def profile_memory() -> dict:
         import torch
         if torch.cuda.is_available():
             result["gpu_name"] = torch.cuda.get_device_name(0)
-            result["gpu_mem_total_mb"] = round(torch.cuda.get_device_properties(0).total_mem / (1024**2))
+            result["gpu_mem_total_mb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024**2))
             result["gpu_mem_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024**2))
             result["gpu_mem_reserved_mb"] = round(torch.cuda.memory_reserved() / (1024**2))
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

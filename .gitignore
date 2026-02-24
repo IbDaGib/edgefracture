@@ -30,5 +30,8 @@ skills-lock.json
 .DS_Store
 Thumbs.db
 
+# Gradio
+.gradio/
+
 # Jupyter
 .ipynb_checkpoints/

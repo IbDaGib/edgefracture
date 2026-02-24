@@ -504,6 +504,7 @@ def step_triage(image, clinical_context):
     body_region, region_detected = _detect_region_medgemma(pil_image)
     result = get_classifier().classify(pil_image, body_region)
     result["region_auto_detected"] = region_detected
+    get_classifier().release_model()
 
     # FIX #15: audit-log every triage prediction
     prediction_logger.log_prediction(
@@ -925,6 +926,4 @@ if __name__ == "__main__":
     app = build_ui()
     app.launch(
         server_name=args.host, server_port=args.port, share=args.share,
-        theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate"),
-        css=CUSTOM_CSS,
     )
